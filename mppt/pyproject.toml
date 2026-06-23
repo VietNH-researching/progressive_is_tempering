@@ -1,0 +1,23 @@
+[build-system]
+requires = ["setuptools>=67"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "mppt"
+version = "0.1.0"
+requires-python = ">=3.10"
+dependencies = [
+    "jax",
+    "jaxlib",
+    "chex",
+    "scipy",
+    "numpy",
+    "tqdm",
+    "matplotlib",
+    "statsmodels",
+    "seaborn",
+]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["mppt*"]
