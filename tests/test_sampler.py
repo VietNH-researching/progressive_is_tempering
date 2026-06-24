@@ -50,7 +50,8 @@ class TestBackwardSDEStep:
     def test_log_weight_formula(self):
         """
         For u=0, log p_ρ(x_n|x_{n-1}) and log q(x_{n-1}|x_n) are both Gaussian
-        log-densities.  Verify the formula matches a manual computation.
+        log-densities using exact OU coefficients λ=e^{-dt}, σ²=1-e^{-2dt}.
+        Verify the formula matches a manual computation with those same coefficients.
         """
         key = jax.random.PRNGKey(1)
         x_n = jnp.array([0.2, -0.1, 0.5])
@@ -58,11 +59,13 @@ class TestBackwardSDEStep:
         dt = 0.05
         x_prev, lw, eps = backward_sde_step(key, x_n, 1.0, dt=dt, control=control)
 
-        var = 2.0 * dt
-        mean_p = (1.0 - dt) * x_prev
-        log_p_manual = -0.5 * jnp.sum((x_n - mean_p) ** 2) / var
-        mean_q = x_n + (-x_n + control) * dt
-        log_q_manual = -0.5 * jnp.sum((x_prev - mean_q) ** 2) / var
+        lam = jnp.exp(-dt)
+        sigma_sq = 1.0 - jnp.exp(-2.0 * dt)
+        # log p_ρ(x_n | x_prev) = N(x_n; λ x_prev, σ²I)
+        log_p_manual = -0.5 * jnp.sum((x_n - lam * x_prev) ** 2) / sigma_sq
+        # log q(x_prev | x_n) = N(x_prev; λ x_n + (1-λ) u, σ²I);  u=0 here
+        mean_q = lam * x_n
+        log_q_manual = -0.5 * jnp.sum((x_prev - mean_q) ** 2) / sigma_sq
         expected_lw = log_p_manual - log_q_manual
 
         assert jnp.allclose(lw, expected_lw, atol=1e-5)

@@ -664,11 +664,8 @@ def periodic_eval_plot(params, outer_step):
     if buffers[M].is_ready(1):
         n_buf = min(train_cfg.n_eval_particles, buffers[M].size)
         key, subkey = jax.random.split(key)
-        x_buf, lw_buf = buffers[M].sample(subkey, n_buf)
-        key, subkey = jax.random.split(key)
-        buf_resamp_idx = systematic_resample(subkey, lw_buf, n_buf)
-        x_buf_resamp = x_buf[buf_resamp_idx]
-        sns.kdeplot(x=x_buf_resamp[:, 0].tolist(), ax=axes[1], fill=True, alpha=0.4, label="buffer[M] (IS resampled)")
+        x_buf, _ = buffers[M].sample(subkey, n_buf)
+        sns.kdeplot(x=x_buf[:, 0].tolist(), ax=axes[1], fill=True, alpha=0.4, label="buffer[M] (IS resampled)")
         axes[1].plot(xs_1d, pdf_true, "r-", lw=2, label="True GMM")
         axes[1].set_title(f"Step {outer_step+1}: buffer[M] 1-D marginal  β={float(betas[M]):.3f}")
     else:

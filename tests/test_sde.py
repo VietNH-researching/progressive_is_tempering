@@ -84,21 +84,22 @@ class TestOUForwardSample:
 
 class TestOULogTransitionDensity:
     def test_gaussian_log_density(self):
-        """Value should match a manually computed Gaussian log-density."""
+        """Value should match a manually computed Gaussian log-density using exact OU coefficients."""
         x_n = jnp.array([0.5, -0.3])
         x_prev = jnp.array([0.0, 0.0])
         dt = 0.1
-        mean = (1.0 - dt) * x_prev
-        var = 2.0 * dt
-        expected = -0.5 * jnp.sum((x_n - mean) ** 2) / var
+        lam = jnp.exp(-dt)
+        sigma_sq = 1.0 - jnp.exp(-2.0 * dt)
+        mean = lam * x_prev
+        expected = -0.5 * jnp.sum((x_n - mean) ** 2) / sigma_sq
         result = ou_log_transition_density(x_n, x_prev, dt)
         assert jnp.allclose(result, expected, atol=1e-6)
 
     def test_peak_at_mode(self):
-        """Log-density is maximized when x_n equals the mean."""
+        """Log-density is maximized when x_n equals the OU mean e^{-dt} x_prev."""
         x_prev = jnp.array([1.0, -1.0])
         dt = 0.05
-        mean = (1.0 - dt) * x_prev
+        mean = jnp.exp(-dt) * x_prev
         perturbed = mean + 0.1 * jnp.ones(2)
         assert ou_log_transition_density(mean, x_prev, dt) > ou_log_transition_density(
             perturbed, x_prev, dt
