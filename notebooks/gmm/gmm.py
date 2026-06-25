@@ -932,3 +932,105 @@ fig.savefig(FIGURES_DIR / "gmm_temperature_ladder.png", dpi=150)
 plt.close(fig)
 print(f"Temperature ladder figure saved.")
 print(f"\nTemperature ladder: {[f'{b:.3f}' for b in betas_list]}")
+
+# %% [markdown]
+# ## 15. Extended Diagnostics
+#
+# Estimates several scalar functionals of $X\sim\pi$ from IS-resampled model
+# samples and compares to ground-truth values computed analytically or via
+# 1-D numerical integration / root-finding.
+#
+# | Functional | Why it matters |
+# |---|---|
+# | $\mathbb{E}[X]$ | Basic mode coverage |
+# | $\sqrt{\mathrm{Var}[X]}$ | Spread / weight balance |
+# | $\mathbb{E}[X^2]$ | Second moment |
+# | $\mathbb{E}[\lvert X\rvert]$ | Asymmetric around zero; catches mode collapse |
+# | $\mathbb{E}[\sin(\pi X)]$ | Oscillatory nonlinear functional |
+# | Median, Q1, Q3 | Quantiles are especially sensitive to the 0.2/0.8 weight split |
+
+# %%
+import numpy as np
+from scipy.integrate import quad as _quad
+from scipy.optimize import brentq as _brentq
+
+_w1, _w2, _mu1, _mu2, _sig = 0.2, 0.8, -1.5, 2.5, 0.5
+
+def _pdf(x):
+    return _w1 * stats.norm.pdf(x, _mu1, _sig) + _w2 * stats.norm.pdf(x, _mu2, _sig)
+
+def _cdf(x):
+    return _w1 * stats.norm.cdf(x, _mu1, _sig) + _w2 * stats.norm.cdf(x, _mu2, _sig)
+
+# ── Ground truth ──────────────────────────────────────────────────────────────
+_gt_mean    = _w1 * _mu1 + _w2 * _mu2                                       # analytical
+_gt_ex2     = _w1*(_mu1**2 + _sig**2) + _w2*(_mu2**2 + _sig**2)             # analytical
+_gt_std     = (_gt_ex2 - _gt_mean**2) ** 0.5                                # analytical
+_gt_eabs,_  = _quad(lambda x: abs(x) * _pdf(x), -20, 20)
+_gt_esinpix,_ = _quad(lambda x: np.sin(np.pi * x) * _pdf(x), -20, 20)
+_gt_median  = _brentq(lambda x: _cdf(x) - 0.50, -10, 10)
+_gt_q1      = _brentq(lambda x: _cdf(x) - 0.25, -10, 10)
+_gt_q3      = _brentq(lambda x: _cdf(x) - 0.75, -10, 10)
+
+# ── Model estimates (IS-resampled samples, averaged over all 16 i.i.d. dims) ──
+_x = np.array(x_resamp).ravel()   # (n_eval_particles * dim,)
+_m_mean    = float(_x.mean())
+_m_std     = float(_x.std())
+_m_ex2     = float((_x**2).mean())
+_m_eabs    = float(np.abs(_x).mean())
+_m_esinpix = float(np.sin(np.pi * _x).mean())
+_m_median  = float(np.median(_x))
+_m_q1      = float(np.percentile(_x, 25))
+_m_q3      = float(np.percentile(_x, 75))
+
+# ── Print table ───────────────────────────────────────────────────────────────
+_rows = [
+    ("E[X]  (mean)",       _m_mean,    _gt_mean),
+    ("std(X)",             _m_std,     _gt_std),
+    ("E[X²]",              _m_ex2,     _gt_ex2),
+    ("E[|X|]",             _m_eabs,    _gt_eabs),
+    ("E[sin(πX)]",         _m_esinpix, _gt_esinpix),
+    ("Median",             _m_median,  _gt_median),
+    ("Q1 (25th pct)",      _m_q1,      _gt_q1),
+    ("Q3 (75th pct)",      _m_q3,      _gt_q3),
+]
+print(f"\n── Diagnostics ({x_resamp.shape[0]}×{x_resamp.shape[1]} samples, averaged over dims) ──")
+print(f"  {'Functional':<20}  {'Model':>10}  {'Ground truth':>12}  {'|error|':>9}")
+print("  " + "─" * 57)
+for _name, _mv, _tv in _rows:
+    print(f"  {_name:<20}  {_mv:>10.4f}  {_tv:>12.4f}  {abs(_mv-_tv):>9.4f}")
+print()
+
+# %%
+# Cauchy IS: draw 100_000 samples from a factorised standard Cauchy,
+# IS-reweight toward the GMM target, then plot the first dimension.
+N_CAUCHY = 100_000
+
+key, subkey = jax.random.split(key)
+x_cauchy = jax.random.cauchy(subkey, (N_CAUCHY, model_cfg.x_dim))
+
+log_target_cauchy = jax.vmap(target.log_prob)(x_cauchy)
+log_cauchy = jnp.sum(-jnp.log(jnp.pi) - jnp.log(1.0 + x_cauchy ** 2), axis=-1)
+lw_cauchy = log_target_cauchy - log_cauchy
+
+ess_cauchy = float(normalized_ess(lw_cauchy))
+print(f"Cauchy IS  ESS: {ess_cauchy:.3f}")
+
+key, subkey = jax.random.split(key)
+cauchy_resamp_idx = systematic_resample(subkey, lw_cauchy, N_CAUCHY)
+x_cauchy_resamp = x_cauchy[cauchy_resamp_idx]
+
+fig, ax = plt.subplots(figsize=(6, 4))
+sns.kdeplot(x=x_cauchy_resamp[:, 0].tolist(), ax=ax, fill=True, alpha=0.4, label="Cauchy IS samples")
+xs_1d = jnp.linspace(-4, 6, 300)
+pdf_true = (w1 * jnp.exp(-0.5*((xs_1d-mu1)/sigma)**2) / (sigma*(2*jnp.pi)**0.5)
+           + w2 * jnp.exp(-0.5*((xs_1d-mu2)/sigma)**2) / (sigma*(2*jnp.pi)**0.5))
+ax.plot(xs_1d, pdf_true, "r-", lw=2, label="True GMM")
+ax.set_xlabel("$x_1$")
+ax.set_ylabel("density")
+ax.set_title(f"1-D marginal: Cauchy IS vs target (GMM in {model_cfg.x_dim} dimensions)")
+ax.legend()
+plt.tight_layout()
+fig.savefig(FIGURES_DIR / "gmm_cauchy_is.png", dpi=150)
+plt.close(fig)
+print(f"Cauchy IS figure saved to {FIGURES_DIR / 'gmm_cauchy_is.png'}")

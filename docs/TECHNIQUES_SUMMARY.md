@@ -65,7 +65,7 @@ The temperature ladder $\{\beta_k\}_{k=0}^M$ is constructed **once**, before any
 `smc_sampler` runs an SMC sweep from $\beta = 0$ to $\beta = 1$. The ladder is built greedily: starting from $\beta_k$, the next level $\beta_{k+1}$ is the largest value such that the normalised ESS of the IS bridge
 
 $$
-\log w_{k \to k+1}(x) = (\beta_{k+1} - \beta_k)\,\bigl(-E(x) + \log\rho(x)\bigr)
+\log w_{k \to k+1}(x) = (\beta_{k+1} - \beta_k)\,\bigl(-E(x) - \log\rho(x)\bigr)
 $$
 
 satisfies $\mathrm{ESS}_{k \to k+1} / N \geq \tau$ (`local_ess_ratio`). The endpoints are clamped exactly to $\beta_0 = 0$ and $\beta_M = 1$.
