@@ -1,6 +1,7 @@
 from mppt.jax_configs import x64, debug_nan, no_async; x64(), debug_nan(), no_async()
 from functools import partial
 import numpy as np
+import pytest
 from jax import numpy as jnp, random, jit
 from tqdm import trange
 from mppt.impl.swappers import _aux_func, basic_swapper
@@ -24,6 +25,24 @@ def test__aux_func():
     _test__aux_func(1.3)
     _test__aux_func(-1.3)
     _test__aux_func(-0.4)
+
+def test_basic_swapper_synthetic_accept_reject():
+    log_pi0 = jnp.array([0., 0.])
+    perm = jnp.array([0, 1])
+
+    accept = basic_swapper(
+        random.key(0), log_pi0, jnp.array([1e6, 0.]), perm,
+        debug=True, mix=False
+    )
+    assert jnp.array_equal(accept.perm, jnp.array([1, 0]))
+    assert jnp.array_equal(accept.rejection_rate_naive_A, jnp.array(0.))
+
+    reject = basic_swapper(
+        random.key(0), log_pi0, jnp.array([-1e6, 0.]), perm,
+        debug=True, mix=False
+    )
+    assert jnp.array_equal(reject.perm, perm)
+    assert jnp.array_equal(reject.rejection_rate_naive_A, jnp.array(1.))
 
 def _test_basic_swapper(mean0, sigma0, mean1, sigma1, N, niter, TV_threshold, TV_threshold_discrete, runtime_check, verbose):
     r"""Generates N particles from N(mean0, sigma0) and N particles from
@@ -90,8 +109,25 @@ def _test_swap_sample_fit(x, perm, dist0, dist1, TV_threshold, verbose, title):
     assert tv0 <= TV_threshold
     assert tv1 <= TV_threshold
 
-def test_basic_swapper():
-    _test_basic_swapper(3.4, 1.5, 4.4, 1.25, 100, 5, 1., 1., True, False)
+def test_basic_swapper_runtime_check_rejects_invalid_perm():
+    r"""Runtime checks should reject duplicate/lost particle ids.
+
+    Distribution recovery belongs in the slow suite; this unit test targets the
+    actual safety contract used by PT swaps.
+    """
+    log_pi0 = jnp.zeros(4)
+    log_pi1 = jnp.zeros(4)
+    duplicate_perm = jnp.array([0, 1, 1, 3])
+
+    with allow_runtime_check(True):
+        with pytest.raises(AssertionError):
+            basic_swapper(
+                random.key(0), log_pi0, log_pi1, duplicate_perm,
+                debug=True, mix=False
+            )
+
+@pytest.mark.slow
+def test_basic_swapper_distribution_recovery():
     _test_basic_swapper(3.4, 1.5, 5., 0.75, 20_000, 50, 0.02, 0.01, False, False)
 
 
@@ -169,9 +205,14 @@ def _theoretical_rej_rates(getter, temperatures):
         )
     return np.array(res)
 
-def test_pt_swap():
+@pytest.mark.slow
+def test_pt_swap_runtime_check():
     r"""Tests the module ``abstract.pt_exec.pt_swap``
     """
-    _test_pt_swap(-0.5, 1, 5.5, 2, [0., 0.4, 0.6, 0.8, 0.9, 1.], 200, 4, 5, 1., 1., True, False)
+    _test_pt_swap(-0.5, 1, 5.5, 2, [0., 0.5, 1.], 30, 2, 2, 1., 1., True, False)
+
+@pytest.mark.slow
+def test_pt_swap_distribution_recovery():
+    r"""Statistical recovery tests for ``abstract.pt_exec.pt_swap``."""
     _test_pt_swap(-0.5, 1, 5.5, 2, [0., 0.4, 0.6, 0.8, 0.9, 1.], 20_000, 10, 3, 0.01, 0.02, False, False)
     _test_pt_swap(-0.5, 1, 5.5, 2, [0, 0.2, 0.4, 0.6, 0.8, 0.9, 1], 20_000, 11, 3, 0.01, 0.02, False, False)

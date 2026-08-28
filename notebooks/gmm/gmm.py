@@ -37,7 +37,6 @@ import optax
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
-import seaborn as sns
 from scipy import stats
 
 from progressive_is_tempering.targets import make_gmm_target
@@ -89,14 +88,14 @@ class TrainingConfig:
 
     # Outer loop
     num_outer_steps: int = 50
-    n_particles: int = 100_000      # K: particles per backward SDE run
+    n_particles: int = 10_000       # K: particles per backward SDE run
 
     # Inner loop
-    n_inner_steps: int = 1_000
+    n_inner_steps: int = 500
     batch_size: int = 512           # B per temperature
 
     # Buffer
-    buffer_capacity: int = 500_000
+    buffer_capacity: int = 50_000
 
     # MALA rejuvenation
     n_mala_rejuv: int = 20          # MALA steps per outer step
@@ -107,7 +106,7 @@ class TrainingConfig:
     target_clip_norm: float = 0.0
 
     # Optimiser
-    learning_rate: float = 3e-4
+    learning_rate: float = 1e-3
     grad_clip: float = 1.0
 
     # MPPT SMC (temperature ladder)
@@ -119,7 +118,7 @@ class TrainingConfig:
     log_every: int = 1              # outer steps between log lines
     save_every: int = 10            # outer steps between checkpoint saves
     eval_every: int = 10            # outer steps between evaluation runs
-    n_eval_particles: int = 100_000
+    n_eval_particles: int = 100_000 # particles for evaluation plots
 
 
 # Instantiate configs — edit these to tune the experiment
@@ -134,7 +133,8 @@ NOTEBOOK_NAME = "gmm"
 CHECKPOINT_DIR = Path("../../checkpoints") / NOTEBOOK_NAME
 LOG_DIR = Path("../../logging")
 FIGURES_DIR = Path("../../figures") / NOTEBOOK_NAME
-for d in [CHECKPOINT_DIR, LOG_DIR, FIGURES_DIR]:
+EVAL_FIGURES_DIR = FIGURES_DIR / "eval"
+for d in [CHECKPOINT_DIR, LOG_DIR, FIGURES_DIR, EVAL_FIGURES_DIR]:
     d.mkdir(parents=True, exist_ok=True)
 
 CHECKPOINT_PATH = CHECKPOINT_DIR / "checkpoint.pkl"
@@ -653,7 +653,7 @@ def periodic_eval_plot(params, outer_step):
     fig, axes = plt.subplots(1, 2, figsize=(12, 4))
 
     # Left: backward SDE model samples
-    sns.kdeplot(x=x_resamp[:, 0].tolist(), ax=axes[0], fill=True, alpha=0.4, label="Model (IS resampled)")
+    axes[0].hist(x_resamp[:, 0].tolist(), bins=60, density=True, alpha=0.4, label="Model (IS resampled)")
     axes[0].plot(xs_1d, pdf_true, "r-", lw=2, label="True GMM")
     axes[0].set_xlabel("$x_1$")
     axes[0].set_ylabel("density")
@@ -665,7 +665,7 @@ def periodic_eval_plot(params, outer_step):
         n_buf = min(train_cfg.n_eval_particles, buffers[M].size)
         key, subkey = jax.random.split(key)
         x_buf, _ = buffers[M].sample(subkey, n_buf)
-        sns.kdeplot(x=x_buf[:, 0].tolist(), ax=axes[1], fill=True, alpha=0.4, label="buffer[M] (IS resampled)")
+        axes[1].hist(x_buf[:, 0].tolist(), bins=60, density=True, alpha=0.4, label="buffer[M] (IS resampled)")
         axes[1].plot(xs_1d, pdf_true, "r-", lw=2, label="True GMM")
         axes[1].set_title(f"Step {outer_step+1}: buffer[M] 1-D marginal  β={float(betas[M]):.3f}")
     else:
@@ -677,7 +677,7 @@ def periodic_eval_plot(params, outer_step):
     axes[1].legend()
 
     plt.tight_layout()
-    fname = FIGURES_DIR / f"eval_step{outer_step+1:04d}.png"
+    fname = EVAL_FIGURES_DIR / f"eval_step{outer_step+1:04d}.png"
     fig.savefig(fname, dpi=150)
     plt.close(fig)
     print(f"  [eval] step {outer_step+1}  model ESS={ess_eval:.3f}  → {fname}")
@@ -878,7 +878,7 @@ key, subkey = jax.random.split(key)
 resamp_idx = systematic_resample(subkey, lw_eval, len(lw_eval))
 x_resamp = x_eval[resamp_idx]
 
-sns.kdeplot(x=x_resamp[:, 0].tolist(), ax=axes[0], fill=True, alpha=0.4, label="Model samples (IS)")
+axes[0].hist(x_resamp[:, 0].tolist(), bins=60, density=True, alpha=0.4, label="Model samples (IS)")
 # True GMM marginal
 xs_1d = jnp.linspace(-4, 6, 300)
 w1, w2 = 0.2, 0.8
@@ -1001,36 +1001,3 @@ for _name, _mv, _tv in _rows:
     print(f"  {_name:<20}  {_mv:>10.4f}  {_tv:>12.4f}  {abs(_mv-_tv):>9.4f}")
 print()
 
-# %%
-# Cauchy IS: draw 100_000 samples from a factorised standard Cauchy,
-# IS-reweight toward the GMM target, then plot the first dimension.
-N_CAUCHY = 100_000
-
-key, subkey = jax.random.split(key)
-x_cauchy = jax.random.cauchy(subkey, (N_CAUCHY, model_cfg.x_dim))
-
-log_target_cauchy = jax.vmap(target.log_prob)(x_cauchy)
-log_cauchy = jnp.sum(-jnp.log(jnp.pi) - jnp.log(1.0 + x_cauchy ** 2), axis=-1)
-lw_cauchy = log_target_cauchy - log_cauchy
-
-ess_cauchy = float(normalized_ess(lw_cauchy))
-print(f"Cauchy IS  ESS: {ess_cauchy:.3f}")
-
-key, subkey = jax.random.split(key)
-cauchy_resamp_idx = systematic_resample(subkey, lw_cauchy, N_CAUCHY)
-x_cauchy_resamp = x_cauchy[cauchy_resamp_idx]
-
-fig, ax = plt.subplots(figsize=(6, 4))
-sns.kdeplot(x=x_cauchy_resamp[:, 0].tolist(), ax=ax, fill=True, alpha=0.4, label="Cauchy IS samples")
-xs_1d = jnp.linspace(-4, 6, 300)
-pdf_true = (w1 * jnp.exp(-0.5*((xs_1d-mu1)/sigma)**2) / (sigma*(2*jnp.pi)**0.5)
-           + w2 * jnp.exp(-0.5*((xs_1d-mu2)/sigma)**2) / (sigma*(2*jnp.pi)**0.5))
-ax.plot(xs_1d, pdf_true, "r-", lw=2, label="True GMM")
-ax.set_xlabel("$x_1$")
-ax.set_ylabel("density")
-ax.set_title(f"1-D marginal: Cauchy IS vs target (GMM in {model_cfg.x_dim} dimensions)")
-ax.legend()
-plt.tight_layout()
-fig.savefig(FIGURES_DIR / "gmm_cauchy_is.png", dpi=150)
-plt.close(fig)
-print(f"Cauchy IS figure saved to {FIGURES_DIR / 'gmm_cauchy_is.png'}")

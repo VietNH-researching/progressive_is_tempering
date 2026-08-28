@@ -111,14 +111,14 @@ final_state, intermediate_stats, final_stats = parallel_tempering(
 | `key` | JAX key | required | Random seed |
 | `problem` | `PTProblem` | required | Problem definition |
 | `temperatures` | array or list | required | Schedule from 0 to 1, e.g. `[0, 0.1, 0.3, 0.6, 1.0]` |
-| `n_iter` | int | required | Number of PT iterations (each = explore + swap) |
+| `n_iter` | int | required | Number of PT iterations (each = explore + swap). Must be at least 1. |
 | `init_state` | `PTState` or array | `None` | Starting particles. If array, shape `(T, N, d)`. If `None`, draws from reference. |
-| `n_particles` | int | `None` | Particles per temperature. Ignored if `init_state` given. |
+| `n_particles` | int | `None` | Particles per temperature. Required and positive when `init_state=None`; ignored if `init_state` given. |
 | `engine` | dict | `{'name': 'random_walk', 'maxniter': 100}` | MCMC kernel (see [Engines](#engines)) |
 | `explorer` | dict | `{'mode': 'adaptive'}` | Exploration mode (see [Explorers](#explorers)) |
 | `collectors` | list | `default_collectors` | Statistics to collect (see [Collectors](#collectors)) |
-| `n_inner_swaps` | int | 3 | How many times to re-pair and attempt swaps within each adjacent temperature pair (see [algorithm description](#one-iteration-of-the-algorithm)) |
-| `n_outer_swaps` | int | `len(temperatures)` | How many even/odd sweep passes to perform (see [algorithm description](#one-iteration-of-the-algorithm)) |
+| `n_inner_swaps` | int | 3 | How many times to re-pair and attempt swaps within each adjacent temperature pair. Must be nonnegative. See [algorithm description](#one-iteration-of-the-algorithm). |
+| `n_outer_swaps` | int | `len(temperatures)` | How many even/odd sweep passes to perform. Must be nonnegative. See [algorithm description](#one-iteration-of-the-algorithm). |
 | `verbose` | bool | `True` | Print progress bar and timing |
 | `runtime_check` | bool | `False` | Enable chex debug assertions (slow) |
 | `swapper` | dict | `{'mix': True}` | Swapper config (see [Swappers](#swappers)) |
@@ -204,10 +204,10 @@ particles, logZ, temperatures = smc_sampler(
 |-----------|------|---------|-------------|
 | `key` | JAX key | required | Random seed |
 | `problem` | `PTProblem` | required | Problem definition |
-| `n_particles` | int | required | Number of particles |
+| `n_particles` | int | required | Number of particles. Must be positive. |
 | `engine` | dict | required | MCMC kernel config |
-| `n_mcmc_steps` | int | required | MCMC steps per SMC iteration |
-| `local_ess_ratio` | float | required | Target ESS ratio for choosing the next temperature. Lower values (e.g., 0.3) take bigger temperature jumps but lose more particles to resampling. Higher values (e.g., 0.9) take smaller jumps but preserve more diversity. 0.5 is a reasonable default. |
+| `n_mcmc_steps` | int or `None` | required | MCMC steps per SMC iteration. Must be nonnegative; use `None` for adaptive step count. |
+| `local_ess_ratio` | float | required | Target ESS ratio for choosing the next temperature. Must lie in `(0, 1)`. Lower values (e.g., 0.3) take bigger temperature jumps but lose more particles to resampling. Higher values (e.g., 0.9) take smaller jumps but preserve more diversity. 0.5 is a reasonable default. |
 | `verbose` | bool | required | Print iteration info |
 | `runtime_check` | bool | required | Enable chex checks |
 | `keep_all_states` | bool | `False` | If `True`, return stacked particle positions `(n_steps+1, N, d)` across all temperature steps. Useful for initializing PT. |
@@ -215,12 +215,12 @@ particles, logZ, temperatures = smc_sampler(
 **Returns** `(particles, logZ_dict, temperatures_list)`:
 
 - `particles`: final particle state, or stacked array if `keep_all_states=True`
-- `logZ_dict`: dict with keys `'SMC_like'`, `'reverse_logistic'`, `'robust'`.
+- `logZ_dict`: dict with keys `'SMC_like'`, `'robust'`, `'reverse_logistic'`.
   Values are the total logZ estimate $\log(Z_{\text{target}} / Z_{\text{ref}})$.
 - `temperatures_list`: list of discovered temperatures from 0 to 1
 
 When `verbose=True`, each iteration prints logZ as a tuple
-`(SMC_like, reverse_logistic, robust)`.
+`(SMC_like, robust, reverse_logistic)`.
 
 **Typical workflow**: run SMC to discover temperatures, then feed the output
 into parallel tempering:
@@ -455,6 +455,22 @@ So `Z[-1]` picks out the $N$ particles at the highest temperature (the target).
 
 
 ## Interpreting diagnostics
+
+For quick logging or checkpoint manifests, use the diagnostics summary helper:
+
+```python
+from mppt import summarize_diagnostics, print_diagnostics_summary
+
+summary = summarize_diagnostics(final_stats)
+print(summary.warnings)
+
+print_diagnostics_summary(final_stats)
+```
+
+The helper returns plain Python scalars/lists and soft warnings. It does not
+certify convergence; it only flags obvious issues such as non-finite values,
+large disagreement between logZ estimators, very low/high MCMC acceptance away
+from the reference temperature, or near-total swap rejection.
 
 **logZ estimates**: the three estimators should roughly agree if the chain has
 converged. Large discrepancies suggest insufficient mixing or too few particles.

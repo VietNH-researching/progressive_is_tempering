@@ -12,6 +12,7 @@ from mppt.abstract.mcmc import batch_init_extend, batch_move
 from mppt.utils import new_jax_key
 import numpy as np
 import chex
+import pytest
 from tqdm import trange
 
 DummyHMCProblem = namedtuple('DummyHMCProblem',
@@ -42,7 +43,9 @@ def dummy_problem(seed, d, R, adapt_cov=True, eps=None):
 def _test_reversibility(seed, d, eps, verbose=False):
     problem = dummy_problem(seed, d, 0.66, adapt_cov=False, eps=eps)
     hmc_obj = problem.hmc_obj
-    x = problem.scipy_target_dist.rvs()
+    # Reversibility is a deterministic integrator identity; a fixed starting
+    # point makes velocity-sign and leapfrog-order regressions reproducible.
+    x = random.multivariate_normal(random.key(seed + 1000), problem.mean, problem.cov)
     x = hmc_obj.init_extend(random.key(seed), x)
     if verbose:
         print('init position')
@@ -56,11 +59,11 @@ def _test_reversibility(seed, d, eps, verbose=False):
         print(y.position)
         print('terminal veloc')
         print(y.veloc)
-    chex.assert_trees_all_close(x, z)
+    chex.assert_trees_all_close(x, z, atol=1e-10, rtol=1e-10)
 
 def test_reversibility():
-    for _ in range(30):
-        _test_reversibility(np.random.randint(low=0, high=2**31), 3, np.random.rand())
+    for seed, eps in [(1, 0.2), (17, 0.5), (42, 0.9), (123, 0.05), (999, 0.75)]:
+        _test_reversibility(seed, 3, eps)
 
 def _run_dummy_pb(dp: DummyHMCProblem, N: int, niter: int,
                   acc_threshold: tuple, TV_threshold: float, verbose):
@@ -84,10 +87,12 @@ def _run_dummy_pb(dp: DummyHMCProblem, N: int, niter: int,
         print('Acc rate', acc_rate)
     assert acc_threshold[0] <= acc_rate <= acc_threshold[1]
 
+@pytest.mark.slow
 def test_recover_langevin():
     dummy_prob = dummy_problem(82, 60, 1)
     _run_dummy_pb(dummy_prob,30_000, 50, (0.53, 0.63), 0.02, False)
 
+@pytest.mark.slow
 def test_invariant():
     dummy_prob = dummy_problem(82, 25, 0.05, eps=0.48)
     _run_dummy_pb(dummy_prob,20_000, 100, (0.9, 1.0), 0.02, False)
@@ -108,6 +113,7 @@ def _test_adapt_stepsize(d, N, seed_problem, seed_exec, target_acc, niter_max, v
     key, subkey = random.split(key)
     adapt_stepsize_tester(subkey, dummy_prob.hmc_obj, x, target_acc, niter_max, verbose)
 
+@pytest.mark.slow
 def test_adapt_stepsize():
     _test_adapt_stepsize(20, 1000, 9, 99, (0.8, 0.95), 4, False)
     _test_adapt_stepsize(20, 1000, 9, 99, (0.2, 0.3), 10, False)

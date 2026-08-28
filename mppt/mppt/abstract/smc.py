@@ -8,6 +8,8 @@ from mppt.jax_configs import ALLOW_RUNTIME_CHECK, chex_runtime_assert
 from mppt.utils import is_all_same, bisection, pytree_index, pytree_length
 from mppt.impl import logZ_estimators as logZ_library
 
+_KNOWN_LOGZ_ESTIMATORS = ('SMC_like', 'robust', 'reverse_logistic')
+
 class OneStepSMCResult(NamedTuple):
     r"""Output of one SMC step: the resampled-and-moved particles at the new
     temperature, local log-normalizing-constant estimates, and the number of
@@ -61,11 +63,18 @@ def ess_ratio(lw):
     particles. ESS = 1/sum(W_i^2) where W_i are normalized weights.
     Returns a value in (0, 1]; 1 means all weights are equal.
     """
-    W = jnp.exp(lw - logsumexp(lw))
-    # Guard: if all weights are -inf, W is all-nan (inf - inf). Replace with 0.
-    W = jnp.where(jnp.isnan(W), 0., W)
+    log_total = logsumexp(lw)
+    W = jax.lax.cond(
+        jnp.isfinite(log_total),
+        lambda: jnp.exp(lw - log_total),
+        lambda: jnp.zeros_like(lw),
+    )
     denom = lw.shape[0] * jnp.sum(W**2)
-    return 1 / jnp.maximum(denom, 1e-30)
+    return jax.lax.cond(
+        denom > 0,
+        lambda: 1 / denom,
+        lambda: jnp.array(0., dtype=denom.dtype),
+    )
 
 def get_next_temperature(x: PTParticles, new_ess_ratio: Float, tol) -> Float:
     r"""Find the next temperature t_next > t_current such that reweighting
@@ -150,6 +159,18 @@ def _get_logZ(key, x: PTParticles, x_next: PTParticles, t, t_next, logZ_estimato
     res = {}
     for est in logZ_estimators:
         key, subkey = random.split(key)
-        res[est] = getattr(logZ_library, est)(subkey,
-                                              arr_old, arr_new, jnp.array([0., 1.]))
+        estimator = _resolve_logZ_estimator(est)
+        res[est] = estimator(subkey, arr_old, arr_new, jnp.array([0., 1.]))
     return res
+
+def _resolve_logZ_estimator(name: str):
+    r"""Resolve SMC logZ estimator names with a stable error boundary.
+
+    SMC calls this inside a jitted step, so an unknown name should fail while
+    tracing with an actionable ``ValueError`` rather than an ``AttributeError``
+    from a dynamic module lookup.
+    """
+    if name not in _KNOWN_LOGZ_ESTIMATORS:
+        known = ', '.join(_KNOWN_LOGZ_ESTIMATORS)
+        raise ValueError(f"Unknown SMC logZ estimator '{name}'. Known estimators: {known}")
+    return getattr(logZ_library, name)

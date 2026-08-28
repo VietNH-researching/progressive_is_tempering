@@ -7,7 +7,7 @@ from typing import NamedTuple, Optional
 from mppt.abstract.mcmc import PTMCMCEngine, batch_reset_temperature, repeated_batch_move, batch_init_extend
 from mppt.abstract.pt_concept import PTState, PTProblem, TwoLevelSwapper, repeated_swap, geometric_anneal, \
     LogZ_Estimator
-from jax import numpy as jnp, Array, vmap, tree as jax_tree, random, lax
+from jax import numpy as jnp, Array, vmap, tree as jax_tree, random, lax, errors as jax_errors
 from mppt.utils import pytree_index, random_split, while_loops_executor, pytree_length, inverse_permutation, dummy_use
 from jax.typing import ArrayLike
 
@@ -53,15 +53,21 @@ def reset_temperature(state: PTState, problem: PTProblem, temperatures: Array,
     return PTState(jax_tree.map(jnp.concatenate, X), state.Z).validate_shape()
 
 def _validate_temperatures(temperatures: Array):
-    r"""Check that temperatures start at 0 and end at 1.
+    r"""Check that temperatures are a valid increasing schedule from 0 to 1.
     Uses float() to extract concrete values, so this must be called
     outside of JIT-traced code.
     """
+    if len(temperatures.shape) != 1:
+        raise ValueError(f'temperatures must be a 1D array (got shape {temperatures.shape})')
+    if temperatures.shape[0] < 2:
+        raise ValueError('temperatures must contain at least two values')
     t0, t_last = float(temperatures[0]), float(temperatures[-1])
     if abs(t0) > 1e-6:
         raise ValueError(f'temperatures must start at 0 (got {t0})')
     if abs(t_last - 1.) > 1e-6:
         raise ValueError(f'temperatures must end at 1 (got {t_last})')
+    if not bool(jnp.all(jnp.diff(temperatures) > 0)):
+        raise ValueError('temperatures must be strictly increasing')
 
 def pt_initialize(key, problem: PTProblem, temperatures: Array, nparticles: Optional[int],
                   mcmc_engine: PTMCMCEngine, debug=False, particles=None) -> PTState:
@@ -85,6 +91,12 @@ def pt_initialize(key, problem: PTProblem, temperatures: Array, nparticles: Opti
     In all modes, particles are extended via ``mcmc_engine`` and temperatures
     are assigned via ``reset_temperature``.
     """
+    try:
+        _validate_temperatures(temperatures)
+    except jax_errors.ConcretizationTypeError:
+        # Public UI entry points validate concrete temperatures before tracing.
+        # Direct jitted uses cannot convert traced values with float()/bool().
+        pass
     T, = temperatures.shape
     rvs_ref = vmap(problem.rvs_ref)
     if debug:

@@ -3,7 +3,7 @@ from typing import NamedTuple, Callable, Protocol
 from jax import Array, lax, random
 from jax.typing import ArrayLike
 from mppt.abstract.mcmc import MCMCParticle, MCMC, MCMCParticles, generic_nsteps_adapter, generic_stepsize_adapter
-from mppt.utils import follow_protocol, has_nan, dummy_use, WhileLoop, set_named_tuple_attr
+from mppt.utils import follow_protocol, dummy_use, WhileLoop, set_named_tuple_attr
 from jax import numpy as jnp
 from jax.scipy.linalg import solve_triangular
 
@@ -50,10 +50,17 @@ def fixed_cov_mv_normal(eps: Float, cov: Array) -> FixedCovMVNormal:
     d, _d = cov.shape
     assert _d == d
 
-    chol = jnp.linalg.cholesky(cov)
-    chol_failed = has_nan(chol)
-    chol = lax.cond(chol_failed, lambda: _chol_diag(cov), lambda: chol)
-    # if cholesky failed we'll just take the diag
+    cov = (cov + cov.T) / 2
+    eigvals = jnp.linalg.eigvalsh(cov)
+    chol_failed = jnp.logical_or(
+        jnp.logical_not(jnp.all(jnp.isfinite(eigvals))),
+        jnp.min(eigvals) <= 0.,
+    )
+    chol = lax.cond(
+        chol_failed,
+        lambda: _chol_diag(cov),
+        lambda: jnp.linalg.cholesky(cov),
+    )
     log_det_chol = jnp.sum(jnp.log(jnp.diag(chol)))
 
     return FixedCovMVNormal(eps, cov, chol, log_det_chol, chol_failed)

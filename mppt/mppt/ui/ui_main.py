@@ -1,6 +1,7 @@
 from __future__ import annotations
 from collections import defaultdict
 from functools import partial
+from numbers import Integral, Real
 from typing import Union
 
 from mppt.abstract.mcmc import batch_init_extend
@@ -16,6 +17,36 @@ from mppt.ui.frozen import FrozenDict, FrozenList
 from mppt.ui.swappers_api import parse_swappers
 from mppt.utils import verbose_scan, jit_with_info, random_split, run_time
 
+def _validate_int_count(name: str, value, minimum: int, *, allow_none: bool = False):
+    r"""Validate Python-side control counts before JAX tracing/compilation.
+
+    Silent negative or missing counts are especially costly here: they can turn
+    a ``lax.fori_loop`` into a no-op or fail much later inside compiled code.
+    """
+    if value is None:
+        if allow_none:
+            return None
+        raise ValueError(f"{name} must be an integer >= {minimum} (got None)")
+    if isinstance(value, bool) or not isinstance(value, Integral):
+        raise ValueError(f"{name} must be an integer >= {minimum} (got {value!r})")
+    value = int(value)
+    if value < minimum:
+        raise ValueError(f"{name} must be an integer >= {minimum} (got {value})")
+    return value
+
+def _validate_open_unit_interval(name: str, value):
+    r"""Validate probabilities controlling adaptive schedules.
+
+    For SMC, endpoints are invalid: ESS ratio 1 can produce no temperature
+    progress, while 0 asks for complete degeneracy.
+    """
+    if isinstance(value, bool) or not isinstance(value, Real):
+        raise ValueError(f"{name} must be a float in (0, 1) (got {value!r})")
+    value = float(value)
+    if not 0. < value < 1.:
+        raise ValueError(f"{name} must be a float in (0, 1) (got {value})")
+    return value
+
 default_collectors = FrozenList([
     {'name': 'logZ', 'estimator': 'SMC_like'}, {'name': 'logZ', 'estimator': 'robust'},
     {'name': 'logZ', 'estimator': 'reverse_logistic'},
@@ -24,7 +55,7 @@ default_collectors = FrozenList([
     {'name': 'swap_rejection_rates'}  # , {'name': 'index_matrix'} (don't collect to save memory)
 ])
 
-def _build_pt_step(problem, temperatures, engine, explorer, collectors,
+def _build_pt_step(problem, temperatures, engine, explorer, collectors, *,
                    n_outer_swaps, n_inner_swaps, swapper):
     r"""Parse configs and build the PT step closure.
 
@@ -39,6 +70,8 @@ def _build_pt_step(problem, temperatures, engine, explorer, collectors,
         n_outer_swaps = len(temperatures)
     if n_inner_swaps is None:
         n_inner_swaps = 3
+    n_outer_swaps = _validate_int_count('n_outer_swaps', n_outer_swaps, 0)
+    n_inner_swaps = _validate_int_count('n_inner_swaps', n_inner_swaps, 0)
 
     def step(carry, _, last_iter: bool = False):
         r"""One PT iteration: explore -> collect post-explore stats -> swap ->
@@ -118,8 +151,15 @@ def parallel_tempering(
     """
     temperatures = jnp.array(temperatures)
     _validate_temperatures(temperatures)
-    step, mcmc = _build_pt_step(problem, temperatures, engine, explorer,
-                                collectors, n_outer_swaps, n_inner_swaps, swapper)
+    n_iter = _validate_int_count('n_iter', n_iter, 1)
+    if init_state is None:
+        n_particles = _validate_int_count('n_particles', n_particles, 1)
+    elif n_particles is not None:
+        n_particles = _validate_int_count('n_particles', n_particles, 1)
+    step, mcmc = _build_pt_step(
+        problem, temperatures, engine, explorer, collectors,
+        n_outer_swaps=n_outer_swaps, n_inner_swaps=n_inner_swaps, swapper=swapper
+    )
 
     subkey = key
     if not isinstance(init_state, PTState):
@@ -188,8 +228,11 @@ def pt_manual_runners(
     """
     temperatures = jnp.array(temperatures)
     _validate_temperatures(temperatures)
-    step, mcmc = _build_pt_step(problem, temperatures, engine, explorer,
-                                collectors, n_inner_swaps, n_outer_swaps, swapper)
+    n_particles = _validate_int_count('n_particles', n_particles, 1)
+    step, mcmc = _build_pt_step(
+        problem, temperatures, engine, explorer, collectors,
+        n_outer_swaps=n_outer_swaps, n_inner_swaps=n_inner_swaps, swapper=swapper
+    )
 
     def one_step_ordinary_compact(key, prev):
         carry_in = {'key': key, 'state': prev}
@@ -277,9 +320,22 @@ def smc_sampler(key, problem: PTProblem, n_particles, engine, n_mcmc_steps, loca
     only the final particles.
     :return: (particles, logZ_dict, temperatures_list)
 
-    When verbose=True, each iteration prints logZ as a tuple
-    (SMC_like, reverse_logistic, robust).
+    When ``verbose=True``, each iteration prints:
+
+      * ``dlogZ``  = log(Z_t / Z_{t_prev}), the step's incremental log-ratio
+      * ``logZ(t)`` = log(Z_t / Z_0),        cumulative so far
+
+    Values are reported for the three logZ estimators; their order is printed
+    in the header and matches the order of ``logZ_dict`` in the return value.
+    At t = 1, ``logZ(t)`` equals the final log(Z_target / Z_ref).
     """
+    n_particles = _validate_int_count('n_particles', n_particles, 1)
+    n_mcmc_steps = _validate_int_count(
+        'n_mcmc_steps', n_mcmc_steps, 0, allow_none=True
+    )
+    local_ess_ratio = _validate_open_unit_interval(
+        'local_ess_ratio', local_ess_ratio
+    )
     mcmc = parse_engine(engine)
 
     # Initialize and compile
@@ -299,32 +355,36 @@ def smc_sampler(key, problem: PTProblem, n_particles, engine, n_mcmc_steps, loca
         mover = jit(mover)
 
     # Run
-    logZ = []
+    logZ_ret = defaultdict(float)   # cumulative log(Z_t / Z_0) per estimator
     all_temperatures = [0.]
     all_states = [x.position]
+    header_printed = False
     while not jnp.allclose(x.temperature, 1):
         key, subkey = random.split(key)
         x, logZ_local, niter_mcmc = mover(subkey, x)
-        logZ.append(logZ_local)
+        for _k, _v in logZ_local.items():
+            logZ_ret[_k] += _v
         if verbose:
-            logZ_vals = '({})'.format(', '.join(f'{float(v):.3f}' for v in logZ_local.values()))
+            if not header_printed:
+                est_order = ', '.join(logZ_local.keys())
+                print(f'--- SMC anneal | estimators: ({est_order}) ---')
+                print('    dlogZ = log(Z_t / Z_prev)   |   logZ(t) = log(Z_t / Z_0)')
+                header_printed = True
+            dlogZ_str = '(' + ', '.join(f'{float(v):>9.3f}' for v in logZ_local.values()) + ')'
+            cumZ_str  = '(' + ', '.join(f'{float(logZ_ret[k]):>9.3f}' for k in logZ_local.keys()) + ')'
             t_val = float(x.temperature[0])
             t_str = f'{t_val:.2e}' if t_val < 0.001 else f'{t_val:.6f}'
-            print(f'iter {int(x.temperature_idx[0]):>2d} | t={t_str} '
-                  f'| acc={float(jnp.mean(x.accepted)):.2f} | niter={niter_mcmc} '
-                  f'| logZ={logZ_vals}')
+            print(f'iter {int(x.temperature_idx[0]):>3d} | t={t_str} '
+                  f'| acc={float(jnp.mean(x.accepted)):.2f} | niter={niter_mcmc:>3d} '
+                  f'| dlogZ={dlogZ_str} | logZ(t)={cumZ_str}')
         all_temperatures.append(x.temperature[0])
         if keep_all_states:
             all_states.append(x.position)
 
-    logZ_ret = defaultdict(float)
-    for dict_entry in logZ:
-        for dict_key, dict_value in dict_entry.items():
-            logZ_ret[dict_key] += dict_value
-
     if verbose:
-        logZ_vals = '({})'.format(', '.join(f'{float(v):.3f}' for v in logZ_ret.values()))
-        print(f'logZ total={logZ_vals}  [SMC_like, reverse_logistic, robust]')
+        est_order = ', '.join(logZ_ret.keys())
+        total_str = '(' + ', '.join(f'{float(v):+.4f}' for v in logZ_ret.values()) + ')'
+        print(f'--- SMC done | logZ = log(Z_1 / Z_0) = {total_str}   [{est_order}] ---')
 
     if keep_all_states:
         x = jnp.array(all_states)

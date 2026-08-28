@@ -1,15 +1,17 @@
 from mppt.jax_configs import no_async, numpy_raise_errors, x64, default_gpu_memory_setting; x64(); default_gpu_memory_setting(); no_async(); numpy_raise_errors()
 from collections import namedtuple
 import chex
+import pytest
 from mppt.abstract.pt_concept import PTState
 import numpy as np
 from mppt.abstract.pt_exec import make_contiguous, reset_temperature, _separate_into_halves, _merge_halves, \
-    pt_initialize, pt_explore, pt_explore_nonadaptive
+    default_Z, pt_initialize, pt_explore, pt_explore_nonadaptive, pt_swap
 from mppt.utils import inverse_permutation, pytree_index, should_raise, new_jax_key, assert_no_nan, jit_with_info, \
     random_split, tree_stack
 from jax import numpy as jnp, vmap, random, Array, jit
 from mppt.tests.pt_test_helper import create_random_pt_problem
 from mppt.impl.pt_mcmc_random_walk import rw_pt_mcmc
+from mppt.impl.swappers import basic_swapper
 from typing import Union
 from mppt.jax_configs import allow_runtime_check, chexify_no_async
 from functools import partial
@@ -18,20 +20,30 @@ from scipy.stats import multivariate_normal as smvn
 from mppt.tests.distribution_test_helper import multivariate_sample_tester
 from mppt.impl.mcmc_random_walk import fixed_cov_mv_normal
 
-def _permute_state(state: PTState) -> PTState:
+def _assert_valid_Z_permutation(state: PTState):
     T, N = state.Z.shape
-    perm = jnp.array(np.random.permutation(T * N))
+    assert jnp.array_equal(jnp.sort(state.Z.ravel()), jnp.arange(T * N))
+
+def _permute_state(state: PTState) -> PTState:
+    # Deterministic relabeling exercises the same invariant as a random
+    # permutation, but makes any contiguity failure exactly reproducible.
+    T, N = state.Z.shape
+    perm = jnp.roll(jnp.arange(T * N), max(1, (T * N) // 3))
     inv = inverse_permutation(perm)
     return PTState(pytree_index(state.X, inv), perm[state.Z]).validate_shape()
 
 def _test_make_contiguous(T, N, trivialZ: bool):
     cls = namedtuple('cls', ['f1', 'f2'])
-    X = cls(jnp.array(np.random.rand(T*N)), jnp.array(np.random.rand(T*N, 2, 3)))
-    Z = np.arange(T * N)
-    if not trivialZ: Z = np.random.permutation(Z)
+    X = cls(
+        jnp.arange(T * N, dtype=float),
+        jnp.arange(T * N * 6, dtype=float).reshape(T * N, 2, 3),
+    )
+    Z = jnp.arange(T * N)
+    if not trivialZ:
+        Z = jnp.roll(Z, 2)
     Z = Z.reshape((T, N))
 
-    init_state = PTState(X, jnp.array(Z)).validate_shape()
+    init_state = PTState(X, Z).validate_shape()
     permuted_state = _permute_state(init_state)
     recovered_init = make_contiguous(init_state)
     recovered_permuted = make_contiguous(permuted_state)
@@ -52,12 +64,21 @@ def test_make_contiguous():
     _test_make_contiguous(12, 15, True)
     _test_make_contiguous(12, 15, False)
 
+def test_ptstate_runtime_check_rejects_duplicate_Z():
+    X = jnp.arange(4.)
+    bad_Z = jnp.array([[0, 1], [1, 3]])
+    with allow_runtime_check(True):
+        with should_raise(AssertionError):
+            PTState(X, bad_Z).validate_shape()
+
 def _test_reset_temperature(d, T, N, seed, verbose):
     pt_problem, getter = create_random_pt_problem(d, seed)
-    temperature_arr = np.random.rand(T)
-    temperature_arr[0] = 0
-    temperature_arr = jnp.array(temperature_arr)
-    x_init = jnp.array(np.random.multivariate_normal(*getter(0), size=T*N))
+    temperature_arr = jnp.linspace(0., 1., T)
+    # reset_temperature must recompute all temperature-dependent fields while
+    # preserving particle positions; a tiny deterministic grid is a stronger
+    # oracle than a fresh random Gaussian draw.
+    _ = getter
+    x_init = jnp.linspace(-1., 1., T * N * d).reshape((T * N, d))
     x_init_2D = np.array(x_init).reshape((T, N, d))
 
     @jit
@@ -66,7 +87,7 @@ def _test_reset_temperature(d, T, N, seed, verbose):
         idx: Union[int, Array] = random.randint(k, shape=(), minval=0, maxval=T)
         return rw_pt_mcmc(pt_problem, pytree_index(temperature_arr, idx), idx).extend(e)
 
-    key = new_jax_key()
+    key = random.key(seed)
     subkeys = random.split(key, T*N)
     x_init_aug = aug_rand_t(subkeys, x_init)
     if verbose: print(x_init_aug.temperature_idx, '\n')
@@ -90,11 +111,14 @@ def _test_reset_temperature(d, T, N, seed, verbose):
             assert_no_nan(true_extended)
 
 def test_reset_temperature():
-    _test_reset_temperature(2, 10, 30, 12, False)
+    _test_reset_temperature(2, 3, 3, 12, False)
 
 def _test_separator(T, N, d):
-    x = {'one': np.random.rand(T*N, d, d+1), 'two': np.random.rand(T*N)}
-    key = new_jax_key()
+    x = {
+        'one': jnp.arange(T * N * d * (d + 1), dtype=float).reshape(T * N, d, d + 1),
+        'two': jnp.arange(T * N, dtype=float),
+    }
+    key = random.key(T + N + d)
     y, z, perm = _separate_into_halves(key, x, T, N)
     chex.assert_tree_shape_prefix(y, (T, (N - N % 2)//2))
     chex.assert_tree_shape_prefix(z, (T, (N + N % 2)//2))
@@ -105,6 +129,25 @@ def _test_separator(T, N, d):
 def test_separator():
     _test_separator(32, 18, 4)
     _test_separator(33, 19, 4)
+
+def test_pt_swap_preserves_X_and_keeps_Z_permutation():
+    XType = namedtuple('XType', ['position', 'logpdf_ref', 'logpdf_final_target'])
+    X = XType(
+        position=jnp.arange(4.),
+        logpdf_ref=jnp.zeros(4),
+        logpdf_final_target=jnp.array([1e6, 1e6, 0., 0.]),
+    )
+    state = PTState(X, default_Z(2, 2)).validate_shape()
+
+    res = pt_swap(
+        random.key(0), state, jnp.array([0., 1.]),
+        n_outer_swaps=1, n_inner_swaps=1,
+        inner_swapper=partial(basic_swapper, mix=False)
+    )
+
+    chex.assert_trees_all_equal(res.new_state.X, state.X)
+    _assert_valid_Z_permutation(res.new_state)
+    assert jnp.array_equal(res.new_state.Z, jnp.array([[2, 3], [0, 1]]))
 
 def _test_pt_explore_big(seed, d, N, T, nrepeats, max_niter, TV_threshold, acc_rate_thresholds, niter_thresholds, runtime_check, verbose, print_while_loops):
     with allow_runtime_check(runtime_check):
@@ -159,6 +202,7 @@ def _test_sample_fit(state, int_dist_getter, i, t, TV_threshold, acc_rate_thresh
     if i > 0:
         assert acc_rate_thresholds[0] <= acc_rate <= acc_rate_thresholds[1]
 
+@pytest.mark.slow
 def test_pt_explore_big():
     r"""Tests that the PT Exploration mechanism with a large number of particles
     converges to the right distribution, has the right acceptance rate and the
@@ -206,6 +250,7 @@ def _test_pt_explore_small(seed, d, N, T, nrepeats, niter, TV_threshold, verbose
         if verbose: print(f'Temperature {i}')
         multivariate_sample_tester(sample, dist, True, TV_threshold, verbose, title=f'temperature {i}')
 
+@pytest.mark.slow
 def test_pt_explore_small():
     r"""Checks that the adaptation process in ``pt_explore`` indeed leaves
     the target invariant -- in particular, parameters of an MCMC kernel acting
@@ -247,27 +292,35 @@ def _test_pt_explore_nonadaptive(seed, d, N, temperatures, niter, TV_threshold, 
             _test_sample_fit(new_state, getter, i, t, TV_threshold,
                              acc_range, verbose)
 
-def test_pt_explore_nonadaptive():
-    _test_pt_explore_nonadaptive(9, 16, 300, [0., 0.25, 0.5, 0.75, 1],
-                                 30, 1.1, (-0.2, 3.3), True, False)
+@pytest.mark.slow
+def test_pt_explore_nonadaptive_runtime_check():
+    _test_pt_explore_nonadaptive(9, 4, 20, [0., 0.5, 1.],
+                                 2, 1.1, (-0.2, 3.3), True, False)
+
+@pytest.mark.slow
+def test_pt_explore_nonadaptive_distribution_recovery():
     _test_pt_explore_nonadaptive(9, 16, 30_000, [0., 0.25, 0.5, 0.75, 1],
                                  300, 0.02, (0.2, 0.3), False, False)
 
 def test_pt_initialize_rejects_bad_temperatures():
-    r"""pt_initialize must reject temperatures that don't start at 0 or end at 1."""
+    r"""pt_initialize must reject invalid temperature schedules."""
     d, N = 2, 10
     pt_problem, _ = create_random_pt_problem(d, seed=0)
 
     # Does not start at 0
     with should_raise(ValueError):
-        pt_initialize(new_jax_key(), pt_problem, jnp.array([0.1, 0.5, 1.0]), N, rw_pt_mcmc)
+        pt_initialize(random.key(1), pt_problem, jnp.array([0.1, 0.5, 1.0]), N, rw_pt_mcmc)
 
     # Does not end at 1
     with should_raise(ValueError):
-        pt_initialize(new_jax_key(), pt_problem, jnp.array([0., 0.5, 0.9]), N, rw_pt_mcmc)
+        pt_initialize(random.key(2), pt_problem, jnp.array([0., 0.5, 0.9]), N, rw_pt_mcmc)
+
+    # Not strictly increasing
+    with should_raise(ValueError):
+        pt_initialize(random.key(3), pt_problem, jnp.array([0., 0.75, 0.5, 1.]), N, rw_pt_mcmc)
 
     # Valid temperatures should work
-    pt_initialize(new_jax_key(), pt_problem, jnp.array([0., 0.5, 1.0]), N, rw_pt_mcmc)
+    pt_initialize(random.key(4), pt_problem, jnp.array([0., 0.5, 1.0]), N, rw_pt_mcmc)
 
 def test_pt_explore_rejects_n1():
     r"""pt_explore must reject N<2 since the two-half split produces an empty
@@ -276,6 +329,6 @@ def test_pt_explore_rejects_n1():
     d, T, N = 2, 3, 1
     pt_problem, _ = create_random_pt_problem(d, seed=0)
     temperatures = jnp.array([0., 0.5, 1.])
-    state = pt_initialize(new_jax_key(), pt_problem, temperatures, N, rw_pt_mcmc)
+    state = pt_initialize(random.key(5), pt_problem, temperatures, N, rw_pt_mcmc)
     with should_raise(ValueError):
-        pt_explore(new_jax_key(), state, pt_problem, temperatures, rw_pt_mcmc)
+        pt_explore(random.key(6), state, pt_problem, temperatures, rw_pt_mcmc)

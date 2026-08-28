@@ -36,13 +36,13 @@ from dataclasses import dataclass
 from functools import partial
 from pathlib import Path
 
+import numpy as np
 import jax
 import jax.numpy as jnp
 import optax
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
-import seaborn as sns
 
 from jax_pdf import DW4
 
@@ -92,14 +92,14 @@ class TrainingConfig:
     n_particles: int = 10_000     # K: particles per backward SDE run
 
     # Inner loop
-    n_inner_steps: int = 50_000
+    n_inner_steps: int = 500
     batch_size: int = 512        # B per temperature
 
     # Buffer
     buffer_capacity: int = 50_000
 
     # MALA rejuvenation
-    n_mala_rejuv: int = 20_000       # MALA steps per particle per outer step
+    n_mala_rejuv: int = 200       # MALA steps per particle per outer step
     mala_h: float = 0.2
 
     # Clipping (DW4 values from IMPLEMENTATION_EGNN.md)
@@ -107,7 +107,7 @@ class TrainingConfig:
     target_clip_norm: float = 20.0
 
     # Optimiser
-    learning_rate: float = 3e-4
+    learning_rate: float = 1e-3
     grad_clip: float = 1.0
 
     # MPPT SMC (temperature ladder)
@@ -118,7 +118,7 @@ class TrainingConfig:
     # Checkpointing / logging
     log_every: int = 1
     save_every: int = 1
-    eval_every: int = 10
+    eval_every: int = 1
     n_eval_particles: int = 10_000
 
 
@@ -131,7 +131,8 @@ NOTEBOOK_NAME = "dw4"
 CHECKPOINT_DIR = Path("../../checkpoints") / NOTEBOOK_NAME
 LOG_DIR = Path("../../logging")
 FIGURES_DIR = Path("../../figures") / NOTEBOOK_NAME
-for d in [CHECKPOINT_DIR, LOG_DIR, FIGURES_DIR]:
+EVAL_FIGURES_DIR = FIGURES_DIR / "eval"
+for d in [CHECKPOINT_DIR, LOG_DIR, FIGURES_DIR, EVAL_FIGURES_DIR]:
     d.mkdir(parents=True, exist_ok=True)
 
 CHECKPOINT_PATH = CHECKPOINT_DIR / "checkpoint.pkl"
@@ -808,38 +809,32 @@ def periodic_eval_plot(params, outer_step, pt_ref_samples=None):
     x_resamp = x0_eval[resamp_idx]
 
     r_model = get_pairwise_distances(x_resamp)  # (n_eval, 6)
+    r_model_flat = r_model.flatten().tolist()
 
     fig, ax = plt.subplots(figsize=(8, 4))
-    for pair_idx in range(6):
-        sns.kdeplot(
-            x=r_model[:, pair_idx].tolist(), ax=ax,
-            alpha=0.5, label=f"pair {pair_idx}",
-        )
+    ax.hist(r_model_flat, bins=150, density=True, histtype="step",
+            linewidth=1.5, color="blue", label="model")
 
     if pt_ref_samples is not None:
         pt_x = pt_ref_samples.reshape(-1, model_cfg.x_dim)
         r_ref = get_pairwise_distances(pt_x)
-        for pair_idx in range(6):
-            sns.kdeplot(
-                x=r_ref[:, pair_idx].tolist(), ax=ax,
-                linestyle="--", alpha=0.5, color="black",
-                label="MPPT ref" if pair_idx == 0 else None,
-            )
+        r_ref_flat = r_ref.flatten().tolist()
+        ax.hist(r_ref_flat, bins=150, density=True, histtype="step",
+                linewidth=1.5, linestyle="--", color="red", label="MPPT ref")
 
     ax.set_xlabel("inter-particle distance $r_{ij}$")
     ax.set_ylabel("density")
     ax.set_title(f"Step {outer_step+1}: pairwise distances  ESS={ess_eval:.3f}")
     ax.legend(fontsize=8)
     plt.tight_layout()
-    fname = FIGURES_DIR / f"eval_step{outer_step+1:04d}.png"
+    fname = EVAL_FIGURES_DIR / f"eval_step{outer_step+1:04d}.png"
     fig.savefig(fname, dpi=150)
     plt.close(fig)
     print(f"  [eval] step {outer_step+1}  model ESS={ess_eval:.3f}  → {fname}")
 
 
 # Load pre-computed reference samples
-import numpy as _np
-_ref_npz = _np.load(Path("../../data/dw4_samples.npz"))
+_ref_npz = np.load(Path("../../data/dw4_samples.npz"))
 _pt_ref = jnp.array(_ref_npz["particles"])  # (100000, 4, 2); reshaped to (-1, 8) when used
 print(f"Loaded reference samples: {_pt_ref.shape}")
 
@@ -1036,12 +1031,14 @@ fig, axes = plt.subplots(1, 2, figsize=(12, 4))
 
 # Left: all pairwise distances flattened into one array
 r_model_flat = r_model.flatten().tolist()
-sns.kdeplot(x=r_model_flat, ax=axes[0], fill=True, color="blue", alpha=0.4, label="model")
+axes[0].hist(r_model_flat, bins=150, density=True, histtype="step",
+             linewidth=1.5, color="blue", label="model")
 
 if _pt_ref is not None:
     r_ref = get_pairwise_distances(_pt_ref.reshape(-1, model_cfg.x_dim))
     r_ref_flat = r_ref.flatten().tolist()
-    sns.kdeplot(x=r_ref_flat, ax=axes[0], fill=False, color="red", label="MPPT ref")
+    axes[0].hist(r_ref_flat, bins=150, density=True, histtype="step",
+                 linewidth=1.5, linestyle="--", color="red", label="MPPT ref")
 
 axes[0].set_xlabel("inter-particle distance $r_{ij}$")
 axes[0].set_ylabel("density")

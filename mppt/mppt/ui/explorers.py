@@ -36,9 +36,13 @@ def parse_explorer(mode: str, niter=None, mcmc_params=None) -> UIExplorer:
         else:
             return partial(_adaptive_with_niter, niter=niter)
     elif mode == 'nonadaptive':
+        if niter is None:
+            raise ValueError("nonadaptive explorer requires 'niter'")
+        if mcmc_params is None:
+            raise ValueError("nonadaptive explorer requires 'mcmc_params'")
         return partial(_nonadaptive, mcmc_params=mcmc_params, niter=niter)
     else:
-        raise ValueError('Unknown explorer mode')
+        raise ValueError(f"Unknown explorer mode '{mode}'")
 
 def _adaptive(key, state: PTState, problem: PTProblem, temperatures: Array,
               engine: PTMCMCEngine) -> SimpleExploreResult:

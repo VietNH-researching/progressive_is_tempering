@@ -4,6 +4,7 @@ from mppt.tests.distribution_test_helper import np_random_mean_and_cov
 from jax import random, numpy as jnp, vmap, jit, block_until_ready
 from jax.scipy.stats import multivariate_normal as jmvn
 import numpy as np
+import pytest
 from mppt.tests.test_mcmc_random_walk import _test_RW_invariance_helper
 from mppt.utils import new_jax_key, assert_no_nan
 import chex
@@ -33,16 +34,17 @@ def _test_rw_pt_mcmc_invariance(
         niter, acc_rate_range, tv_threshold, verbose, nparams_setter
     )
 
+@pytest.mark.slow
 def test_rw_pt_mcmc_invariance():
     _test_rw_pt_mcmc_invariance(20, 30, 40, 0.65, 20_000, 600, (0.19, 0.29), 0.02, False)
     _test_rw_pt_mcmc_invariance(20, 11, 22, 0, 20_000, 1, (0., 1.), 0.02, False)
 
 def _test_rw_pt_temperature_reset(d, seed, good_t, bad_t, nsamples):
     pt_problem, intermediate_dist_getter = create_random_pt_problem(d, seed)
-    np.random.seed()
-    mean_target, cov_target = intermediate_dist_getter(good_t)
-    sample = np.random.multivariate_normal(mean=mean_target, cov=cov_target,
-                                           size=nsamples)
+    _ = intermediate_dist_getter(good_t)
+    # Temperature reset is a field-recomputation contract; deterministic
+    # positions expose wiring bugs without turning this into a sampler test.
+    sample = jnp.linspace(-1., 1., nsamples * d).reshape((nsamples, d))
     bad_mcmc = rw_pt_mcmc(pt_problem, bad_t, 1)
     bad_sample = batch_extend(sample, bad_mcmc)
     good_mcmc = rw_pt_mcmc(pt_problem, good_t, 1)
@@ -94,5 +96,6 @@ def _test_rw_pt_nsteps_adapt(d, seed, t, nsamples, nrepeats, verbose):
 
     assert jnp.array_equal(wrap_res, naked_res)
 
+@pytest.mark.slow
 def test_rw_pt_nsteps_adapt():
     _test_rw_pt_nsteps_adapt(10, 12, 0.65, 1000, 10, False)

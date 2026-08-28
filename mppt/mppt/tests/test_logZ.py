@@ -11,6 +11,7 @@ from mppt.tests.pt_test_helper import create_pt_problem_1d
 from mppt.utils import new_jax_key
 import numpy as np
 from typing import Callable
+from collections import namedtuple
 
 def _test_logZ_helper(mean0, sigma0, mean1, sigma1, temperatures, N, nrepeats, estimator: LogZ_Estimator, iq_threshold, verbose, logZ_true=1234, runtime_check=True):
     temperatures = np.array(temperatures)
@@ -58,13 +59,36 @@ def _test_logZ_standard_set(mean0=3.0, sigma0=2.0, mean1=3.9, sigma1=0.7, est: C
     _test_logZ_helper(mean0, sigma0, mean1, sigma1, random_temperatures, 10000, 50, est, threshold, verbose, runtime_check=runtime_check)
     _test_logZ_helper(mean0, sigma0, mean1, sigma1, [0., 1.], 20000, 50, est, threshold, verbose, runtime_check=runtime_check)
 
+def test_identical_reference_target_has_zero_logZ():
+    r"""If reference and target log densities agree pointwise, all annealed
+    density ratios are exactly one, so logZ is exactly zero.
+    """
+    temperatures = jnp.array([0., 0.25, 0.75, 1.])
+    T, N = len(temperatures), 3
+    logpdf = jnp.array([
+        -0.1, -1.2, -2.3,
+        -0.4, -1.5, -2.6,
+        -0.7, -1.8, -2.9,
+        -1.0, -2.1, -3.2,
+    ])
+    XType = namedtuple('XType', ['logpdf_ref', 'logpdf_final_target'])
+    X = XType(logpdf_ref=logpdf, logpdf_final_target=logpdf)
+    state = PTState(X, default_Z(T, N))
+    key = random.key(0)
+
+    assert jnp.allclose(estimate_logZ(key, state, temperatures, SMC_like), 0.)
+    assert jnp.allclose(estimate_logZ(key, state, temperatures, robust), 0.)
+
+@pytest.mark.slow
 def test_logZ_SMC_like():
     _test_logZ_standard_set()
 
+@pytest.mark.slow
 def test_logZ_robust():
     _test_logZ_standard_set(est=robust)
     _test_logZ_standard_set(3.9, 0.7, 3, 2, est=robust)
 
+@pytest.mark.slow
 def test_robust_vs_smc_like():
     r"""Verify that robust() and SMC_like() agree on the same data, and that
     both recover the known logZ across different distribution parameters.

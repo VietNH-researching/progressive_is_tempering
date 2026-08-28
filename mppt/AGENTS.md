@@ -3,6 +3,18 @@
 A JAX library for multi-particle parallel tempering MCMC.
 See `docs/architecture.md` for design rationale and `docs/codemap.md` for file layout.
 
+## Provider-Agnostic Agent Policy
+
+This repository is intended to be usable by any coding agent or human
+contributor, not by one LLM provider's tooling. Keep durable project knowledge
+in committed files such as `AGENTS.md`, `readme.md`, and `docs/`. Do not require
+provider-specific folders, local memories, or hidden overlays to understand,
+test, or modify the code.
+
+Local tool state such as `.claude/`, `.codex/`, and `.agents/` is machine- or
+provider-specific and must stay uncommitted. If an agent discovers a generally
+useful lesson, move it into this file or `docs/` in provider-neutral language.
+
 ## Quick Orientation
 
 - Entry points: `parallel_tempering`, `pt_manual_runners`, `smc_sampler` in `mppt/ui/ui_main.py`
@@ -30,8 +42,11 @@ Tests use pytest with plain test functions. A `conftest.py` autouse fixture
 resets `ALLOW_RUNTIME_CHECK` after each test to prevent cross-test state leakage.
 
 ```bash
-# Run all tests
-python -m pytest mppt/tests/ -v
+# Fast default suite: deterministic/unit-level tests only
+python -m pytest mppt/tests/ -q -m "not slow"
+
+# Full suite, including slow Monte Carlo calibration/integration tests
+python -m pytest mppt/tests/ -q --slow
 
 # Run a single test file
 python -m pytest mppt/tests/test_swappers.py -v
@@ -40,8 +55,26 @@ python -m pytest mppt/tests/test_swappers.py -v
 python -m pytest mppt/tests/test_utils.py::test_bisection -v
 ```
 
-Some tests are compute-heavy (large particle counts, many iterations).
-If a test seems to hang, it may just be slow on CPU.
+Tests marked `slow` are compute-heavy Monte Carlo calibration/integration
+checks with large particle counts or many iterations. Run them explicitly,
+preferably as PBS jobs on compute nodes.
+
+On shared HPC systems, do not run slow tests, large notebooks, or long Monte
+Carlo jobs on a login/head node. Use the local scheduler instructions for that
+machine and keep the fast `not slow` pytest suite as the normal edit-loop
+verification.
+
+### Test Design Policy
+
+Default tests should fail fast on deterministic contracts: shapes, no-NaN
+guards, permutation invariants for `Z`, exact log-density identities, parser
+errors, and tiny hand-computed swap or reset examples. Use fixed JAX keys or
+hand-built fixtures; do not add unseeded NumPy randomness to the fast suite.
+
+Monte Carlo convergence, distribution recovery, KDE/TV comparisons, tight
+acceptance-rate checks, and large logZ simulations belong under
+`@pytest.mark.slow`. Those tests are useful calibration checks, but they should
+not be the normal agentic edit loop.
 
 The `TEST_MODE` flag in `mppt/tests/__init__.py` must be `False` for normal operation.
 It exists to prevent JAX from loading before env vars are set.
@@ -53,6 +86,9 @@ It exists to prevent JAX from loading before env vars are set.
 | `impl/mcmc_hmc.py` or `impl/pt_mcmc_hmc.py` | `test_mcmc_hmc.py test_pt_mcmc_hmc.py` |
 | `impl/mcmc_random_walk.py` or `impl/pt_mcmc_random_walk.py` | `test_mcmc_random_walk.py test_pt_mcmc_random_walk.py` |
 | `abstract/pt_exec.py` | `test_pt_exec.py` |
+| `abstract/smc.py` | `test_smc.py test_logZ.py` |
+| `ui/ui_main.py` or other `ui/` config parsers | `test_ui_main.py` |
+| `ui/diagnostics.py` | `test_diagnostics.py` |
 | `impl/swappers.py` | `test_swappers.py` |
 | `impl/logZ_estimators.py` | `test_logZ.py` |
 | `utils.py` | `test_utils.py` |
@@ -144,6 +180,16 @@ Modify these with extra care:
 - SMC sampler: beta, functional but less tested
 - `ext_interface/`: benchmarking utility against Chopin's `particles` package, not part of the core library
 - No packaging infrastructure yet (no pyproject.toml)
+
+## Notebooks
+
+Notebooks live in `notebooks/` as paired `.py` (jupytext percent format) and `.ipynb` files.
+
+- **Always edit the `.py` file**, never the `.ipynb` directly.
+- After editing, sync with: `jupytext --sync notebooks/<name>.ipynb`
+- The `.py` file is the source of truth for code; the `.ipynb` holds outputs.
+
+See `notebooks/readme.md` for details.
 
 ## Documentation Map
 

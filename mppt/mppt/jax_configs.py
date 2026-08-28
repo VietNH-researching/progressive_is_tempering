@@ -12,6 +12,8 @@ def x64():
     log-density calculations.
     """
     os.environ['JAX_ENABLE_X64'] = 'True'
+    import jax
+    jax.config.update('jax_enable_x64', True)
 
 def debug_nan():
     r"""Enable NaN detection. When active, JAX raises an error immediately
@@ -19,6 +21,8 @@ def debug_nan():
     debugging numerical instabilities in MCMC kernels.
     """
     os.environ['JAX_DEBUG_NANS'] = 'True'
+    import jax
+    jax.config.update('jax_debug_nans', True)
 
 def _gpu_memory_saver():
     r"""Disable GPU memory pre-allocation. By default JAX pre-allocates most

@@ -24,6 +24,7 @@ mppt/
     engine_ui.py           #   Engine registry (random_walk, hmc, mala)
     explorers.py           #   Exploration modes (adaptive, nonadaptive)
     collectors.py          #   Pluggable stat collectors (logZ, acc rates, etc.)
+    diagnostics.py         #   Plain-Python summaries and warning helpers for diagnostics
     swappers_api.py        #   Swapper config parsing
     frozen.py              #   FrozenDict/FrozenList for immutable defaults
     index_matrix_visualizer.py  # Particle flow visualization
@@ -36,7 +37,7 @@ mppt/
     conftest.py            #   Autouse fixture: resets ALLOW_RUNTIME_CHECK
     distribution_test_helper.py  # TV distance, KDE, sample validation
     pt_test_helper.py      #   Random PT problem generators
-    test_*.py              #   11 test modules
+    test_*.py              #   Focused pytest modules for unit and slow checks
 docs/
   extend.md               # Design doc: the extend pattern philosophy
 notebooks/

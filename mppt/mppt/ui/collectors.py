@@ -54,12 +54,26 @@ def parse_collectors(collector_list: list[Union[dict, CollectorProtocol]]) ->\
             res.append(element)
         else:
             element = element.copy()
-            name = element.pop('name')
-            res.append(all_collectors[name](**element))
+            try:
+                name = element.pop('name')
+            except KeyError as exc:
+                raise ValueError("collector config must include a 'name' field") from exc
+            try:
+                collector_factory = all_collectors[name]
+            except KeyError as exc:
+                known = ', '.join(sorted(all_collectors))
+                raise ValueError(f"Unknown collector '{name}'. Known collectors: {known}") from exc
+            try:
+                res.append(collector_factory(**element))
+            except TypeError as exc:
+                raise ValueError(f"Invalid config for collector '{name}': {exc}") from exc
     return res
 
 @add_collector
 def logZ(estimator: str) -> Collector:
+    if not hasattr(logZ_estimators, estimator):
+        raise ValueError(f"Unknown logZ estimator '{estimator}'")
+
     def func(key, out: SimpleExploreResult, problem: PTProblem,
              temperatures: Array, engine: PTMCMCEngine) -> Float:
         dummy_use(problem, engine)

@@ -85,7 +85,7 @@ Step sizes and covariance matrices are automatically tuned to keep acceptance ra
 ### Parallel tempering from SMC output
 
 ```python
-from mppt import pt_manual_runners
+from mppt import pt_manual_runners, print_diagnostics_summary
 from tqdm import trange
 
 key = random.key(1)
@@ -99,12 +99,15 @@ pt_runner = pt_manual_runners(
 )
 # All JIT compilation happens above; no recompilation from here on.
 
+last_diags = None
 for _ in trange(20):
     key, subkey = random.split(key)
-    x, diags = pt_runner(subkey, x, full_output=False)
+    x, last_diags = pt_runner(subkey, x, full_output=False)
     # The previous x is always destroyed (donate_argnums) to save memory.
     # Use full_output=True for complete diagnostics.
     # Save x to disk between iterations to keep intermediate states.
+
+print_diagnostics_summary(last_diags)
 ```
 
 The option `swapper={'mix': True}` permutes particles before pairing for swaps, rather than running N independent copies of ordinary PT.
@@ -139,6 +142,15 @@ diags['mcmc_acc_rates']
 
 Temperature 0 is always 1.0 (iid sampling from reference). HMC targets 0.9--0.95; RW and MALA differ.
 
+For logs and checkpoint manifests, prefer the plain-Python summary helper:
+
+```python
+from mppt import summarize_diagnostics
+
+summary = summarize_diagnostics(diags)
+print(summary.warnings)
+```
+
 ## Extracting Particles
 
 Particles at the final temperature:
@@ -169,13 +181,19 @@ fig.show()
 
 ## Running Tests
 
-Requires Python 3.11+.
+Requires Python 3.12+.
 
 ```bash
-python -m pytest mppt/tests/ -v
+python -m pytest mppt/tests/ -q -m "not slow"
 ```
 
-Some tests are compute-heavy. See `AGENTS.md` for per-module test commands.
+Slow Monte Carlo calibration checks are marked `slow`; include them explicitly with
+`python -m pytest mppt/tests/ -q --slow`. See `AGENTS.md` for per-module test
+commands.
+
+The default suite is intended for the normal edit loop: deterministic unit
+contracts, fixed keys, shape/permutation checks, and small analytic oracles.
+Long distribution-recovery and convergence checks are kept in the slow suite.
 
 ## Documentation
 
@@ -183,4 +201,4 @@ Some tests are compute-heavy. See `AGENTS.md` for per-module test commands.
 - `docs/architecture.md` -- design decisions and trade-offs
 - `docs/extend.md` -- the extend pattern (how MCMC kernels compose with PT)
 - `docs/codemap.md` -- module layout, dependency graph, key types
-- `AGENTS.md` -- conventions, pitfalls, and agent/contributor instructions
+- `AGENTS.md` -- provider-agnostic conventions, pitfalls, and agent/contributor instructions

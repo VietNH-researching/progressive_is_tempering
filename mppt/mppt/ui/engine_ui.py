@@ -17,8 +17,19 @@ def parse_engine(engine: dict) -> PTMCMCEngine:
     The ``'name'`` key selects the engine; remaining keys are passed as kwargs.
     """
     engine = engine.copy()
-    name = engine.pop('name')
-    return all_engines[name](**engine)
+    try:
+        name = engine.pop('name')
+    except KeyError as exc:
+        raise ValueError("engine config must include a 'name' field") from exc
+    try:
+        engine_factory = all_engines[name]
+    except KeyError as exc:
+        known = ', '.join(sorted(all_engines))
+        raise ValueError(f"Unknown engine '{name}'. Known engines: {known}") from exc
+    try:
+        return engine_factory(**engine)
+    except TypeError as exc:
+        raise ValueError(f"Invalid config for engine '{name}': {exc}") from exc
 
 @register_engine
 def random_walk(maxniter: int = 100, identity_kernel=False,

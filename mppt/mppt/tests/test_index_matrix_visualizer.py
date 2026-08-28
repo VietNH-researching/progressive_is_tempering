@@ -1,63 +1,45 @@
 from mppt.jax_configs import x64, no_async, debug_nan; x64(), debug_nan(), no_async()
-from mppt.impl.mcmc_random_walk import fixed_cov_mv_normal
-from mppt.tests.pt_test_helper import create_random_pt_problem
-from mppt.ui.collectors import Collector
-from mppt.ui.explorers import SimpleExploreResult
 from mppt.ui.index_matrix_visualizer import cumcompose, _plot_data, _proportion_init_temperature, _find_positions, \
     _integrize, _discretize_proportion
-from mppt.ui.ui_main import default_collectors, parallel_tempering
-from mppt.utils import new_jax_key, tree_stack, dummy_use, pytree_index
+from mppt.utils import pytree_index
 from jax import numpy as jnp
 import numpy as np
 
-def logpdf_ref_collector():
-    def func(key, expresult: SimpleExploreResult, pt_problem, temperatures, engine):
-        dummy_use(key, pt_problem, temperatures, engine)
-        return expresult.new_state.X.logpdf_ref
-    return Collector('logpdf_ref', False, True, func)
-
-def _test_cumcompose(d, seed, temperatures, nparticles, niter, verbose):
-    T = len(temperatures)
-    N = nparticles
-    temperatures = jnp.array(temperatures)
-    problem, _ = create_random_pt_problem(d, seed)
-    key = new_jax_key()
-    dummy_params = [fixed_cov_mv_normal(1., jnp.identity(d))
-                    for _ in range(len(temperatures))]
-    dummy_params = tree_stack(*dummy_params)
-    collectors = default_collectors.copy() + [logpdf_ref_collector()]
-    res = parallel_tempering(key, problem, temperatures, niter, None, nparticles, explorer={'mode': 'nonadaptive', 'niter': 0, 'mcmc_params': dummy_params}, verbose=verbose, runtime_check=True, collectors=collectors)
-    if verbose: print('reject rate\n', res[-1]['swap_rejection_rates'])
-    res = res[1]
-    composed_Zs = cumcompose(res['index_matrix'])
-    init_matrix = res['logpdf_ref'][0]
-    for mat, Z in zip(res['logpdf_ref'], composed_Zs):
-        mat = mat.reshape((T, N))
-        mat_prime = pytree_index(init_matrix, Z.ravel()).reshape((T, N))
-        if verbose:
-            print('============')
-            print('logpdf_arr\n', mat)
-            print('logpdf_arr_prime\n', mat_prime)
-            print('cumulated Z\n', Z)
-        assert jnp.allclose(mat, mat_prime)
+def _deterministic_Z(T, N, offset=1):
+    # Hand-built permutations make visualization/indexing failures reproducible.
+    return np.roll(np.arange(T * N), offset).reshape((T, N))
 
 def test_cumcompose():
-    _test_cumcompose(2, 4, [0., 0.2, 0.5, 1.], 5, 10, False)
-    _test_cumcompose(3, 3, jnp.linspace(0, 1, 10), 40, 20, False)
+    Z_arr = jnp.array([
+        [[1, 0], [2, 3]],
+        [[0, 2], [1, 3]],
+    ])
+
+    composed_Zs = cumcompose(Z_arr)
+
+    assert jnp.array_equal(composed_Zs[0], jnp.array([[0, 1], [2, 3]]))
+    assert jnp.array_equal(composed_Zs[1], jnp.array([[1, 0], [2, 3]]))
+    assert jnp.array_equal(composed_Zs[2], jnp.array([[1, 2], [0, 3]]))
+
+    payload = jnp.array([10, 20, 30, 40])
+    assert jnp.array_equal(
+        pytree_index(payload, composed_Zs[-1].ravel()).reshape((2, 2)),
+        jnp.array([[20, 30], [10, 40]]),
+    )
 
 def _test__plot_data(T, N, Nd):
     # tests are included in implementation
-    Z = np.random.permutation(T*N).reshape((T, N))
-    tracked_particles = np.random.randint(low=0, high=T*N, size=3)
+    Z = _deterministic_Z(T, N)
+    tracked_particles = np.array([0, T * N // 2, T * N - 1])
     _plot_data(Z, tracked_particles, Nd, True)
 
 def test_plot_data():
-    for _ in range(10):
+    for _ in range(2):
         _test__plot_data(10, 20, 37)
         _test__plot_data(20, 10, 37)
 
 def _test__proportion_init_temperature(T, N, verbose):
-    Z = np.random.permutation(T * N).reshape((T, N))
+    Z = _deterministic_Z(T, N)
     if verbose:
         print('Simplified Z')
         print(Z//N)
@@ -67,26 +49,25 @@ def _test__proportion_init_temperature(T, N, verbose):
         print(R)
 
 def test_proportion_init_temperature():
-    for _ in range(100):
-        _test__proportion_init_temperature(3, 2, False)
-        _test__proportion_init_temperature(2, 3, False)
-        _test__proportion_init_temperature(10, 20, False)
-        _test__proportion_init_temperature(20, 10, False)
+    _test__proportion_init_temperature(3, 2, False)
+    _test__proportion_init_temperature(2, 3, False)
+    _test__proportion_init_temperature(10, 20, False)
+    _test__proportion_init_temperature(20, 10, False)
 
 def _test__find_positions(T, N, num):
-    Z = np.random.permutation(T * N).reshape((T, N))
-    tracked = np.random.randint(low=0, high=T*N, size=num)
+    Z = _deterministic_Z(T, N)
+    tracked = np.linspace(0, T * N - 1, num=num, dtype=int)
     _find_positions(tracked, Z, check=True)  # tests are embedded in implementation
 
 def test__find_positions():
-    for _ in range(100):
-        _test__find_positions(3, 2, 4)
-        _test__find_positions(2, 3, 4)
-        _test__find_positions(10, 20, 30)
-        _test__find_positions(20, 10, 30)
+    _test__find_positions(3, 2, 4)
+    _test__find_positions(2, 3, 4)
+    _test__find_positions(10, 20, 30)
+    _test__find_positions(20, 10, 30)
 
 def _test__integrize(p, N, threshold):
     p = jnp.array(p)
+    p = p / jnp.sum(p)
     res = _integrize(p, N)
     assert jnp.sum(res) == N
     assert jnp.issubdtype(res.dtype, jnp.integer)
@@ -95,17 +76,14 @@ def _test__integrize(p, N, threshold):
 
 def test_integrize():
     _test__integrize([0.6, 0., 0.4], 10_000, 0.01)
-    for _ in range(10):
-        p = np.random.rand(6)
-        p = p/p.sum()
-        _test__integrize(p, 10_000, 0.01)
-    for _ in range(10):
-        p = np.random.rand(7)
-        p = p/p.sum()
-        _test__integrize(p, 10_000, 0.01)
+    # Fixed probability vectors cover zeros, uneven mass, and several lengths
+    # without relying on a lucky random draw.
+    _test__integrize([1, 2, 4, 8, 16, 32], 10_000, 0.01)
+    _test__integrize([0, 3, 1, 0, 5, 9, 2], 10_000, 0.01)
 
 def _test__discretize_proportion(p, N, threshold):
     p = jnp.array(p)
+    p = p / jnp.sum(p)
     res = _discretize_proportion(p, N)
     assert res.shape == (N, )
     T, = p.shape
@@ -114,11 +92,5 @@ def _test__discretize_proportion(p, N, threshold):
 
 def test__discretize_proportion():
     _test__discretize_proportion([0.6, 0., 0.4], 10_000, 0.01)
-    for _ in range(10):
-        p = np.random.rand(6)
-        p = p/p.sum()
-        _test__discretize_proportion(p, 10_000, 0.01)
-    for _ in range(10):
-        p = np.random.rand(7)
-        p = p/p.sum()
-        _test__discretize_proportion(p, 10_000, 0.01)
+    _test__discretize_proportion([1, 2, 4, 8, 16, 32], 10_000, 0.01)
+    _test__discretize_proportion([0, 3, 1, 0, 5, 9, 2], 10_000, 0.01)

@@ -5,13 +5,14 @@ from mppt.impl.mcmc_random_walk import fixed_cov_mv_normal, rw_mcmc
 from jax import random, numpy as jnp, jit
 from jax.scipy.stats import multivariate_normal as jmvn
 import numpy as np
+import pytest
 from tqdm import trange
 from mppt.abstract.mcmc import batch_move, batch_extend
 from scipy.stats import multivariate_normal as smvn
 from functools import partial
 from mppt.tests.pt_test_helper import adapt_stepsize_tester
 
-def _test_multivar_normal_(mean, cov, cov2, eps, verbose):
+def _test_multivar_normal_(mean, cov, cov2, eps, verbose, key_seed):
     if verbose:
         print('=== New test ===')
         print('mean', mean)
@@ -19,7 +20,7 @@ def _test_multivar_normal_(mean, cov, cov2, eps, verbose):
         print(f'cov2\n{cov2}')
         print('eps', eps)
     cov = eps**2 * cov
-    key = new_jax_key()
+    key = random.key(key_seed)
     x_ref = random.multivariate_normal(key, mean, cov)
     logpdf_ref = jmvn.logpdf(x_ref, mean, cov)
     if verbose:
@@ -36,12 +37,12 @@ def _test_multivar_normal_(mean, cov, cov2, eps, verbose):
     assert jnp.allclose(x_ref, x_res)
     assert jnp.allclose(logpdf_ref, logpdf_res)
 
-def _test_multivar_normal(d, eps, verbose):
-    mean, cov = np_random_mean_and_cov(d)
-    _test_multivar_normal_(mean, cov, cov, eps, verbose)
+def _test_multivar_normal(d, eps, verbose, seed):
+    mean, cov = np_random_mean_and_cov(d, seed=seed)
+    _test_multivar_normal_(mean, cov, cov, eps, verbose, seed + 1000)
 
-def _test_multivar_normal_degenerate(d, eps, verbose):
-    mean, cov = np_random_mean_and_cov(d)
+def _test_multivar_normal_degenerate(d, eps, verbose, seed):
+    mean, cov = np_random_mean_and_cov(d, seed=seed)
     cov = jnp.diag(jnp.diag(cov))
 
     cov2 = np.array(cov)
@@ -56,12 +57,25 @@ def _test_multivar_normal_degenerate(d, eps, verbose):
     else:
         raise AssertionError('Matrix should be degenerate')
 
-    _test_multivar_normal_(mean, cov, cov2, eps, verbose)
+    _test_multivar_normal_(mean, cov, cov2, eps, verbose, seed + 1000)
 
 def test_multivar_normal():
-    _test_multivar_normal(3, 0.45, False)
-    _test_multivar_normal(4, 1.35, False)
-    _test_multivar_normal_degenerate(5, 1.2, False)
+    _test_multivar_normal(3, 0.45, False, seed=11)
+    _test_multivar_normal(4, 1.35, False, seed=12)
+    _test_multivar_normal_degenerate(5, 1.2, False, seed=13)
+
+def test_fixed_cov_mv_normal_non_psd_falls_back_to_diagonal():
+    cov = jnp.array([
+        [4., -10.],
+        [-10., 9.],
+    ])
+
+    res = fixed_cov_mv_normal(0.5, cov)
+
+    assert bool(res.chol_failed)
+    assert jnp.all(jnp.isfinite(res.chol))
+    assert jnp.array_equal(res.chol, jnp.diag(jnp.array([2., 3.])))
+    assert jnp.isfinite(res.logpdf(jnp.zeros(2), jnp.array([1., -1.])))
 
 def _test_RW_invariance(dim, seed_init, seed_target, niter, nparticles, acc_rate_range, tv_threshold, verbose, nparams_setter=20_000, diag_target=False, range_std=(1, 2)):
     mean_init, cov_init = np_random_mean_and_cov(dim, seed=seed_init)
@@ -109,6 +123,7 @@ def _test_RW_invariance_helper(key, mean_target, cov_target, x_init, mcmc, niter
     if verbose: print('acc_rate', acc_rate)
     assert acc_rate_range[0] <= acc_rate <= acc_rate_range[1]
 
+@pytest.mark.slow
 def test_RW_invariance():
     r"""Tests invariance of RWMH and the covariance matrix adaptation (aiming for
     acc. rate of 23%).
@@ -135,6 +150,7 @@ def _test_RW_adapt(seed_problem, seed_exec, d, N, target_range, max_niter, verbo
     key, subkey = random.split(key)
     adapt_stepsize_tester(subkey, mcmc, sample, target_range, max_niter, verbose)
 
+@pytest.mark.slow
 def test_RW_adapt():
     _test_RW_adapt(3, 4, 64, 1000, (0.2, 0.35), 4, False)
     _test_RW_adapt(3, 4, 16, 1000, (0.02, 0.03), 10, False)

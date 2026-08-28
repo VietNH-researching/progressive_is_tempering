@@ -1,5 +1,6 @@
 from mppt.jax_configs import x64, default_gpu_memory_setting; x64(); default_gpu_memory_setting()
 from typing import NamedTuple
+import pytest
 from mppt.impl.pt_mcmc_hmc import hmc_pt_mcmc, HMCParameters
 from mppt.jax_configs import chex_runtime_assert
 from mppt.tests.pt_test_helper import create_random_pt_problem
@@ -16,14 +17,15 @@ from mppt.tests.distribution_test_helper import multivariate_sample_tester
 
 def test_reset_temperature():
     problem, getdist = create_random_pt_problem(10, 10)
-    mean_tar, cov_tar = getdist(1.)
+    _ = getdist(1.)
 
     hmc_pt_t0 = hmc_pt_mcmc(problem, 0.2, 2)
     hmc_pt_t1 = hmc_pt_mcmc(problem, 0.3, 2)
-    x_raw = np.random.multivariate_normal(mean=mean_tar, cov=cov_tar)
-    x_raw = jnp.array(x_raw)
+    # Resetting temperature should keep position/velocity payload identity and
+    # only recompute temperature-dependent log-density fields.
+    x_raw = jnp.linspace(-1., 1., 10)
 
-    key = new_jax_key()
+    key = random.key(10)
     key, subkey = random.split(key)
     x_t0 = hmc_pt_t0.init_extend(subkey, x_raw)
     x_t1 = hmc_pt_t1.init_extend(subkey, x_raw)
@@ -58,7 +60,7 @@ def _test_integrated_hmc(D, SEED, LOGZ, TEMPERATURES, NITER_PT, NPARTICLES, NITE
             return HMCParameters(scaled_cov, R)
         EXPLORER = {'mode': 'nonadaptive', 'niter': NITER_MCMC,
                     'mcmc_params': get_params(jnp.array(TEMPERATURES))}
-    key = new_jax_key()
+    key = random.key(SEED)
 
     state, res, res_last = parallel_tempering(
         key=key, problem=problem, temperatures=TEMPERATURES, n_iter=NITER_PT,
@@ -107,13 +109,14 @@ def test_feed_extend_nan_gradient_guard():
     )
     engine = hmc_pt_mcmc(problem, 0.5, 1)
     x_at_zero = jnp.zeros(2)
-    key = new_jax_key()
+    key = random.key(0)
 
     # With runtime checks ON, should raise due to NaN gradient
     with allow_runtime_check(True):
         with should_raise(AssertionError):
             engine.init_extend(key, x_at_zero)
 
+@pytest.mark.slow
 def test_pt_manual_runners_basic():
     r"""Smoke test for pt_manual_runners: build a runner, run two steps,
     check output structure. First step initializes from scratch via
@@ -146,6 +149,7 @@ def test_pt_manual_runners_basic():
     assert 'mcmc_acc_rates' in diags
     assert 'swap_rejection_rates' in diags
 
+@pytest.mark.slow
 def test_integrated_hmc():
     _test_integrated_hmc(5, 33, 12, [0, 0.25, 0.5, 0.75, 0.875, 1], 30, 30_000, 13, False, verbose=False, target_rate=0.95, rate_threshold=0.05)  # if R were close to zero this would fail
 

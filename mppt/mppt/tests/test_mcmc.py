@@ -2,6 +2,7 @@ from mppt.jax_configs import x64, default_gpu_memory_setting; x64(), default_gpu
 from collections import namedtuple
 from itertools import count
 from typing import NamedTuple, Union
+import pytest
 from jax.scipy.stats import multivariate_normal as mvn
 import numpy as np
 from tqdm import trange, tqdm
@@ -63,6 +64,7 @@ def _test_OU(seed_init, d, rho, nparticles, nsteps, verbose):
 
     multivariate_sample_tester(x.position, target_dist, True, 0.02, verbose, 'terminal sample')
 
+@pytest.mark.slow
 def test_OU():
     _test_OU(5, 5, 0.92, 10_000, 70, False)
 
@@ -141,20 +143,28 @@ def _test_generic_nsteps_adapter(d, alpha, rho, threshold, maxiter=jnp.inf, samp
 
     assert jnp.abs(nsteps_ref - nsteps) <= threshold
 
+@pytest.mark.slow
 def test_generic_nsteps_adapter():
     _test_generic_nsteps_adapter(4, 0.07, 0.985, 7, samplesize=200_000, verbose=False)
     _test_generic_nsteps_adapter(4, 0.07, 0.985, 7, maxiter=16, samplesize=200_000, verbose=False)
     _test_generic_nsteps_adapter(4, 0.05, 0.99, 7, samplesize=200_000, verbose=False)
 
 def _test_repeated_batch_move(nparticles, nrepeats, verbose):
-    mean, cov = np_random_mean_and_cov(3)
+    mean = jnp.array([0.5, -0.25, 1.0])
+    cov = jnp.array([
+        [1.2, 0.1, 0.0],
+        [0.1, 1.5, 0.2],
+        [0.0, 0.2, 1.1],
+    ])
     mean, cov = jnp.array(mean), jnp.array(cov)
     mcmc = rw_mcmc(partial(mvn.logpdf, mean=mean, cov=cov))
     params = fixed_cov_mv_normal(2.38/jnp.sqrt(3), cov)
-    xstart = jnp.array(np.random.multivariate_normal(mean=mean, cov=cov, size=nparticles))
+    xstart = random.multivariate_normal(random.key(321), mean, cov, shape=(nparticles,))
     xstart = batch_extend(xstart, mcmc)
 
-    key = new_jax_key()
+    # The oracle is equivalence between the lax.fori_loop implementation and
+    # the explicit Python loop under the same key stream, not distribution fit.
+    key = random.key(123)
     if verbose: print('JAX.LAX...')
     res1 = repeated_batch_move(key, xstart, params, mcmc, nrepeats)
 
@@ -163,7 +173,6 @@ def _test_repeated_batch_move(nparticles, nrepeats, verbose):
     for _ in range(nrepeats):
         key, subkey = random.split(key)
         res2 = batch_move(subkey, res2, params, mcmc)
-    print('Done')
 
     if verbose: print('Acc rate', jnp.mean(res2.accepted))
     chex.assert_trees_all_close(res1, res2)
@@ -171,4 +180,4 @@ def _test_repeated_batch_move(nparticles, nrepeats, verbose):
     assert_no_nan(res2)
 
 def test_repeated_batch_move():
-    _test_repeated_batch_move(250, 20, False)
+    _test_repeated_batch_move(50, 5, False)

@@ -7,7 +7,7 @@ from functools import partial
 from mppt.impl.swappers import basic_swapper
 
 
-def parse_swappers(mix: bool):
+def parse_swappers(*, mix: bool):
     r"""Return a swapper function with the ``mix`` parameter pre-applied.
 
     :param mix: if True, randomly permute particles before pairing for swaps.
