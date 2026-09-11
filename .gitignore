@@ -5,4 +5,7 @@ __pycache__/
 pita/
 commit_message.txt/
 /data/*
-!/data/redownload.sh
+!/data/redownload.sh/
+- .claude/
+- .codex/
+- .agents/
