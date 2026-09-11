@@ -6,6 +6,7 @@
 #       extension: .py
 #       format_name: percent
 #       format_version: '1.3'
+#       jupytext_version: 1.19.3
 #   kernelspec:
 #     display_name: Python 3
 #     language: python
@@ -33,6 +34,8 @@ from pathlib import Path
 
 import jax
 import jax.numpy as jnp
+from jax.scipy.special import logsumexp
+import numpy as np
 import optax
 import matplotlib
 matplotlib.use("Agg")
@@ -44,9 +47,18 @@ from progressive_is_tempering.net.score_network import ScoreNetwork
 from progressive_is_tempering.sde import ou_forward_sample
 from progressive_is_tempering.resampling import systematic_resample, normalized_ess
 from progressive_is_tempering.sampler import backward_sde_batch
-from progressive_is_tempering.mala import mala_rejuvenate
+from progressive_is_tempering.mppt_rejuvenate import mppt_rejuvenate
 from progressive_is_tempering.buffer import ReplayBuffer
 from progressive_is_tempering.loss import ddpm_loss_single_temp
+from progressive_is_tempering.utils import (
+    C_INK,
+    C_INK_2,
+    C_REF,
+    C_TEST,
+    print_seed_quality_report,
+    smc_seed_quality_figure,
+    style_axis,
+)
 
 # Deterministic seeds
 SEED = 0
@@ -87,19 +99,15 @@ class TrainingConfig:
     n_sde_steps_eval: int = 2000    # backward SDE steps during evaluation
 
     # Outer loop
-    num_outer_steps: int = 50
+    num_outer_steps: int = 10
     n_particles: int = 10_000       # K: particles per backward SDE run
 
     # Inner loop
     n_inner_steps: int = 500
     batch_size: int = 512           # B per temperature
 
-    # Buffer
-    buffer_capacity: int = 50_000
-
-    # MALA rejuvenation
+    # MALA rejuvenation (mppt's own SMC-tuned kernel; see mppt_rejuvenate)
     n_mala_rejuv: int = 20          # MALA steps per outer step
-    mala_h: float = 0.2
 
     # IS clipping / score clipping (setting = 0: disabled for GMM)
     score_clip: float = 0.0
@@ -110,20 +118,61 @@ class TrainingConfig:
     grad_clip: float = 1.0
 
     # MPPT SMC (temperature ladder)
-    mppt_n_particles: int = 10_000
+    #
+    # One number governs the SMC population, the per-rung seed, and the buffer
+    # capacity, because they are the same particles at three points in their
+    # life: SMC propagates N particles up the ladder, every rung's block is fed
+    # whole into that rung's buffer, and the outer loop then evicts them
+    # gradually (FIFO) as backward-SDE data arrives. Subsampling the block was
+    # only ever discarding particles already paid for — and the seed-quality
+    # diagnostic shows rows are not the resource anyway: at N=10k the β=1 block
+    # carried ~101 independent lineages out of 10,000.
+    #
+    # The seed drains in exactly n_smc_particles / n_particles outer steps
+    # (printed at seed time). Keep that comfortably below num_outer_steps, or
+    # the run ends before the network is training on its own data.
+    n_smc_particles: int = 50_000
     mppt_local_ess_ratio: float = 0.5
     mppt_n_mcmc_steps: int = 10
 
+    # --- Derived: seed size and buffer capacity are the SMC population -------
+    @property
+    def buffer_capacity(self) -> int:
+        return self.n_smc_particles
+
+    @property
+    def n_seed_particles(self) -> int:
+        return self.n_smc_particles
+
+    @property
+    def seed_flush_steps(self) -> float:
+        """Outer steps until FIFO has fully retired the SMC seed."""
+        return self.n_smc_particles / self.n_particles
+
     # Checkpointing / logging
     log_every: int = 1              # outer steps between log lines
-    save_every: int = 10            # outer steps between checkpoint saves
-    eval_every: int = 10            # outer steps between evaluation runs
+    save_every: int = 1             # outer steps between checkpoint saves
+    eval_every: int = 1             # outer steps between evaluation runs
     n_eval_particles: int = 100_000 # particles for evaluation plots
 
 
 # Instantiate configs — edit these to tune the experiment
 model_cfg = ModelConfig()
 train_cfg = TrainingConfig()
+
+# The seed fills every buffer to capacity, so FIFO needs `seed_flush_steps`
+# outer steps to retire it. If that exceeds num_outer_steps the run finishes
+# while still training partly on SMC particles, which the seed-quality
+# diagnostic (Section 3) shows are far more degenerate than their row count.
+_flush = train_cfg.seed_flush_steps
+print(f"buffer: {train_cfg.buffer_capacity:,}/rung "
+      f"= {_flush:.3g} generations at K={train_cfg.n_particles:,}")
+print(f"seed retired after outer step {_flush:.3g} "
+      f"of {train_cfg.num_outer_steps} "
+      f"({_flush / train_cfg.num_outer_steps:.0%} of the run)")
+if _flush >= train_cfg.num_outer_steps:
+    print("  WARNING: seed never fully drains — raise num_outer_steps, "
+          "or lower n_smc_particles")
 
 # Resume or start fresh
 resume: bool = False
@@ -150,11 +199,17 @@ LOG_PATH = LOG_DIR / f"{NOTEBOOK_NAME}.txt"
 # $E(x)=-\sum_i\log[\cdots]$.
 
 # %%
+# Mixture parameters live in one place: the target and the exact reference
+# draws in the SMC seed diagnostic below must not be able to drift apart.
+GMM_MEANS = (-1.5, 2.5)
+GMM_WEIGHTS = (0.2, 0.8)
+GMM_STD = 0.5
+
 target = make_gmm_target(
     dim=model_cfg.x_dim,
-    means=(-1.5, 2.5),
-    weights=(0.2, 0.8),
-    std=0.5,
+    means=GMM_MEANS,
+    weights=GMM_WEIGHTS,
+    std=GMM_STD,
 )
 
 # Quick sanity check
@@ -189,14 +244,29 @@ print(f"log_pi_1(0): {log_pi_beta(x0, 1.0):.4f} (= log_prob(0) = {target.log_pro
 #
 # `smc_sampler` (MPPT) runs SMC to find $\{\beta_k\}_{k=0}^M$ such that
 # successive IS weights stay well-behaved (local ESS ratio $\geq0.5$).
-# One round of Parallel Tempering then refines the population.
+#
+# `keep_all_states=True` returns the particle positions at **every** rung,
+# stacked as `(len(betas_list), n_smc_particles, 16)` and indexed in the same
+# order as `betas_list`. These are the only samples available before training
+# that are actually distributed according to $\pi_{\beta_k}$ at each level,
+# and are used to seed the replay buffers (Section 12).
+#
+# `keep_mcmc_params=True` additionally returns the per-rung MALA kernel
+# (covariance + step size) SMC itself adapted while building the ladder. That
+# *same* kernel — not a separately recalibrated one — is reused for
+# outer-loop rejuvenation (Section 13); see `mppt_rejuvenate`. The buffer
+# seed (Section 12) uses SMC's particle output directly, with no further
+# MALA pass.
+#
+# Particle diversification happens explicitly via MALA in the outer loop
+# (Section 13) — no separate parallel-tempering step is run here.
 
 # %%
 import sys
 from pathlib import Path
 sys.path.insert(0, str(Path("../../mppt").resolve()))
 
-from mppt import PTProblem, smc_sampler, pt_manual_runners
+from mppt import PTProblem, smc_sampler
 
 mppt_problem = PTProblem(
     rvs_ref=target.rvs_ref,
@@ -208,41 +278,111 @@ mppt_problem = PTProblem(
 key, subkey = jax.random.split(key)
 print("Running SMC to discover temperature ladder …")
 t0 = time.time()
-smc_particles, logZ_dict, betas_list = smc_sampler(
+smc_particles, logZ_dict, betas_list, mcmc_params_by_rung = smc_sampler(
     subkey,
     mppt_problem,
-    n_particles=train_cfg.mppt_n_particles,
-    engine={"name": "hmc", "refresh_rate": 0.07},
+    n_particles=train_cfg.n_smc_particles,
+    engine={"name": "mala"},
     n_mcmc_steps=train_cfg.mppt_n_mcmc_steps,
     local_ess_ratio=train_cfg.mppt_local_ess_ratio,
     verbose=True,
     runtime_check=False,
     keep_all_states=True,
+    keep_mcmc_params=True,
 )
 print(f"SMC done in {time.time()-t0:.1f}s")
 print(f"Temperature ladder ({len(betas_list)} levels): {[f'{b:.3f}' for b in betas_list]}")
 print(f"logZ estimates: {logZ_dict}")
 
-# %%
-# Parallel Tempering refinement
-key, subkey = jax.random.split(key)
-print("Running Parallel Tempering refinement …")
-t0 = time.time()
-pt_runner = pt_manual_runners(
-    mppt_problem,
-    betas_list,
-    n_particles=train_cfg.mppt_n_particles,
-    engine={"name": "hmc", "refresh_rate": 0.07},
-    explorer={"mode": "adaptive", "niter": 50},
-    swapper={"mix": True},
-)
-# One PT iteration to refine SMC output
-pt_state, _ = pt_runner(subkey, smc_particles, full_output=False)
-print(f"PT refinement done in {time.time()-t0:.1f}s")
+# Scalar MALA step size (ε), adapted per rung by SMC's own acceptance-rate
+# bisection (HMCParameters.scaled_cov.eps) — the same value reused wherever
+# mcmc_params_by_rung is indexed below.
+_eps_by_rung = mcmc_params_by_rung.scaled_cov.eps
+print("MALA step size (ε) adapted by SMC, per rung:")
+for _k, _eps_k in enumerate(_eps_by_rung, start=1):
+    print(f"  rung {_k} (β={betas_list[_k]:.3f}): ε={float(_eps_k):.5g}")
 
+# mcmc_params_by_rung is a *stacked* HMCParameters pytree (leading axis = rung).
+# Indexing it directly with `[k]` would select NamedTuple *field* k (i.e.
+# `.scaled_cov`/`.refresh_rate`), not rung k -- use this helper to index into
+# each leaf's leading axis instead. mcmc_params_for_rung(k) is the HMCParameters
+# SMC adapted and used to move particles into rung k, for k = 1 .. M. This is
+# the *same* kernel reused below (Section 9 demo, Section 13 outer-loop
+# rejuvenation) — no separate post-hoc MALA calibration needed.
+def _mcmc_params_for_rung(k):
+    return jax.tree_util.tree_map(lambda leaf: leaf[k - 1], mcmc_params_by_rung)
+
+# %%
 betas = jnp.array(betas_list)
 M = len(betas_list) - 1  # number of non-reference levels (β_1, …, β_M = 1)
 print(f"M={M} non-reference temperature levels")
+
+# Per-rung particle blocks, indexed to match betas_list. No CoM projection:
+# the GMM target has no translation symmetry, so coordinates are used as-is.
+smc_states = smc_particles  # (n_levels, n_smc_particles, 16)
+assert smc_states.shape[0] == len(betas_list), (
+    f"expected one particle block per rung, got {smc_states.shape[0]} "
+    f"blocks for {len(betas_list)} rungs"
+)
+print(f"SMC particles kept: {smc_states.shape}")
+
+# %% [markdown]
+# ### SMC seed quality at $\beta = 1$
+#
+# The top rung of the ladder targets $\pi_{\beta_M} = \pi$, so it should agree
+# with exact draws from the GMM. This is the one check worth running *before*
+# committing to a training run: it puts a ceiling on what the seeded buffers can
+# teach the network. If SMC has not reached the target at $\beta=1$, no amount
+# of training on its output will fix it.
+#
+# Two failure modes, and they are not the same thing:
+#
+# 1. **Distributional mismatch** — the pooled marginal or the energy simply
+#    disagrees with the reference (top row).
+# 2. **Ancestral degeneracy** — the pooled marginal matches beautifully, yet the
+#    population carries far less independent information than its particle count
+#    suggests (bottom row). SMC resampling collapses the ancestral lineages;
+#    local MCMC then re-equilibrates each particle *within* its mode, erasing
+#    literal duplicates while the mode assignment stays frozen. A distinct-row
+#    count reports 100% unique and misses this entirely.
+#
+# The degeneracy test uses the 16 coordinates as exchangeable features — they
+# are i.i.d. under this factorised target, so every coordinate must give the
+# same exceedance probability $P(x_i > \tau)$. The reference set goes through
+# the identical computation as a control: being exact, it should recover its own
+# size. See `progressive_is_tempering/utils/smc_diagnostics.py`.
+
+# %%
+def gmm_reference_samples(key: jnp.ndarray, n: int) -> jnp.ndarray:
+    """Exact i.i.d. draws from the factorised GMM target, shape (n, x_dim)."""
+    k_comp, k_norm = jax.random.split(key)
+    heavy = jax.random.bernoulli(
+        k_comp, p=GMM_WEIGHTS[1], shape=(n, model_cfg.x_dim)
+    )
+    means = jnp.where(heavy, GMM_MEANS[1], GMM_MEANS[0])
+    return means + GMM_STD * jax.random.normal(k_norm, (n, model_cfg.x_dim))
+
+
+_smc_top = smc_states[-1]                       # (N, 16) at β = β_M = 1
+key, subkey = jax.random.split(key)
+_ref_x = gmm_reference_samples(subkey, train_cfg.n_seed_particles)
+
+# Exchangeable features: the 16 coordinates, i.i.d. under a factorised target.
+_fig, _seed_stats = smc_seed_quality_figure(
+    features_test=np.asarray(_smc_top),
+    features_ref=np.asarray(_ref_x),
+    energy_test=np.asarray(jax.vmap(target.energy)(_smc_top)),
+    energy_ref=np.asarray(jax.vmap(target.energy)(_ref_x)),
+    feature_label="$x_i$ (pooled over coordinates)",
+    title=(f"SMC seed quality at β={float(betas[-1]):.3f} vs exact draws "
+           f"({_smc_top.shape[0]:,} particles)"),
+)
+_fig.savefig(FIGURES_DIR / "gmm_smc_seed_quality.png", dpi=150)
+plt.close(_fig)
+
+print(f"\nSMC seed quality at β={float(betas[-1]):.3f}:")
+print_seed_quality_report(_seed_stats)
+print(f"  → {FIGURES_DIR / 'gmm_smc_seed_quality.png'}")
 
 # %% [markdown]
 # ## 4. Forward Process
@@ -300,11 +440,27 @@ print(f"Input dim: {model_cfg.x_dim} + {model_cfg.time_embedding_dim} + {model_c
 # %% [markdown]
 # ## 6. Backward SDE Sampler
 #
-# Time-reversal of the OU process:
-# $$dY_t=\bigl(-Y_t+2\,s_\theta(Y_t,t,\beta)\bigr)dt+\sqrt{2}\,dW_t,
-#   \quad Y_T\sim\mathcal{N}(0,I)$$
+# Time-reversal of the OU process. In reversed time $\tau=T-t$ (so $\tau$ runs
+# $0\to T$ while the noise time $t$ runs $T\to0$), with $u_\theta=2\,s_\theta$:
+# $$dY_\tau=\bigl(-Y_\tau+u_\theta(Y_\tau,T-\tau,\beta)\bigr)d\tau+\sqrt{2}\,dB_\tau,
+#   \quad Y_{\tau=0}\sim\mathcal{N}(0,I)$$
 #
-# Discretised via Euler–Maruyama from $T$ to $0$.
+# Discretised with an **exponential integrator**, not Euler–Maruyama: freeze
+# $u_\theta$ at the start of each step and solve the remaining linear SDE
+# exactly. With $\Delta t=T/N$ and $t_n=n\,\Delta t$, stepping $n=N,\dots,1$:
+# $$x_{n-1}=\lambda\,x_n+(1-\lambda)\,u_\theta(x_n,t_n,\beta)+\sigma\,\varepsilon_n,
+#   \quad\lambda=e^{-\Delta t},\;\sigma^2=1-e^{-2\Delta t},\;
+#   \varepsilon_n\sim\mathcal{N}(0,I)$$
+#
+# To first order in $\Delta t$ this *is* Euler–Maruyama. The difference is that
+# at $u_\theta\equiv0$ it reproduces the exact OU kernel for any $\Delta t$, so
+# the path weights of Section 7 vanish identically at $\beta=0$.
+#
+# The network is queried at $t_n\in\{\Delta t,\dots,T\}$, never at $t=0$. Training
+# draws $t\ge t_{\min}$, so any grid with $\Delta t<t_{\min}$ queries times the
+# network never saw — here the evaluation grid ($\Delta t=0.002$, $t_{\min}=0.01$)
+# does so for its last steps, $t\approx0.01$ down to $0.002$. See `progressive_is_tempering/sampler.py` and
+# `docs/TECHNIQUES_SUMMARY.md`.
 
 # %%
 @partial(jax.jit, static_argnums=(3, 4, 5, 6, 7))
@@ -374,21 +530,27 @@ print(f"  ‖φ‖={jnp.linalg.norm(phi):.3f},  λ_t={float(lambda_t):.3f}")
 # ## 9. MALA Rejuvenation
 #
 # Diversifies near-duplicate particles after resampling while preserving
-# $\pi_\beta$ as the exact stationary distribution:
-# $$x'=x+\tfrac{h^2}{2}\nabla_x\log\pi_\beta(x)+h\,\varepsilon,
-#   \quad\varepsilon\sim\mathcal{N}(0,I)$$
-# followed by Metropolis–Hastings acceptance.
+# $\pi_\beta$ as the exact stationary distribution. This uses mppt's own
+# covariance-preconditioned MALA-mode HMC kernel — the *same* kernel SMC
+# (Section 3) already tuned per rung via `keep_mcmc_params=True` — rather than
+# a separately calibrated implementation. See `mppt_rejuvenate` for details.
+#
+# Rung 0 (β=0) can't be demoed here: mppt's engine treats `t_idx=0` as "draw
+# fresh from the reference", ignoring the input particles entirely (rung 0 is
+# the frozen exact-Gaussian buffer in Section 12 and is never rejuvenated).
+# The demo below instead uses rung 1.
 
 # %%
-# Demonstrate MALA on reference Gaussian samples at β=0
+# Demonstrate MALA rejuvenation at rung 1, using SMC's own tuned kernel
 key, subkey = jax.random.split(key)
-x_init_demo = jax.random.normal(subkey, (20, model_cfg.x_dim))
+x_init_demo = smc_particles[1][:20]
 key, subkey = jax.random.split(key)
-x_mala_demo, mala_acc = mala_rejuvenate(
-    subkey, x_init_demo, jnp.array(0.0), target.energy,
-    h=train_cfg.mala_h, n_steps=5
+x_mala_demo, mala_acc = mppt_rejuvenate(
+    subkey, x_init_demo, mppt_problem, betas[1], 1,
+    _mcmc_params_for_rung(1), 5,
 )
-print(f"MALA demo (β=0, 5 steps): acceptance rate = {float(mala_acc):.3f}")
+print(f"MALA demo (β={float(betas[1]):.3f}, rung 1, 5 steps): "
+      f"acceptance rate = {float(mala_acc):.3f}")
 
 # %% [markdown]
 # ## 10. IS Bridging Between Adjacent Temperatures
@@ -407,22 +569,47 @@ def is_bridge_log_weights(samples, beta_k, beta_next):
     return delta_beta * (-energies + 0.5 * norms_sq)
 
 
+@jax.jit
+def normalize_log_weights(log_w: jnp.ndarray) -> jnp.ndarray:
+    """Shift a block of log-weights to mean weight 1 (i.e. logsumexp = log n).
+
+    A buffer holds several blocks written at different times, and `.sample()`
+    resamples across all of them jointly — so the blocks' weight *scales* must
+    be commensurable. Raw bridge weights Δβ(-E + ½‖x‖²) are unnormalized,
+    whereas the SMC seed particles are already ≈ π_{β_k} and so carry weight 0.
+    Mixing those two raw would let one block dominate the buffer outright,
+    depending only on sign. Normalizing every block on the way in makes blocks
+    combine in proportion to their particle counts, which is what we want.
+
+    Degenerate blocks (all weights -inf) fall back to uniform.
+    """
+    n = log_w.shape[0]
+    total = logsumexp(log_w)
+    return jnp.where(
+        jnp.isfinite(total),
+        log_w - total + jnp.log(n),
+        jnp.zeros_like(log_w),
+    )
+
+
 # %%
-@partial(jax.jit, static_argnums=(3, 4, 5, 6, 7, 8))
+@partial(jax.jit, static_argnums=(3, 4, 5, 6, 7, 8, 9))
 def _data_gen_parallel(
-    sde_keys,        # (M_active,) typed PRNG keys, one per level
-    resample_keys,   # (M_active,) typed PRNG keys
-    mala_keys,       # (M_active,) typed PRNG keys
-    energy_fn,       # static callable — E(x) → scalar
-    dim,             # static int
-    n_particles,     # static int
-    T,               # static float
-    n_sde_steps,     # static int
-    n_mala_steps,    # static int
-    params,          # network pytree — shared across levels, not batched
-    betas_active,    # (M_active,)  β_k  for k = 1 … M-1
-    betas_next,      # (M_active,)  β_{k+1}
-    mala_hs_active,  # (M_active,)  per-level MALA step sizes
+    sde_keys,            # (M_active,) typed PRNG keys, one per level
+    resample_keys,       # (M_active,) typed PRNG keys
+    mala_keys,           # (M_active,) typed PRNG keys
+    energy_fn,           # static callable — E(x) → scalar
+    dim,                 # static int
+    n_particles,         # static int
+    T,                   # static float
+    n_sde_steps,         # static int
+    n_mala_steps,        # static int
+    mppt_problem,        # static — mppt.PTProblem, same object SMC ran with
+    params,              # network pytree — shared across levels, not batched
+    betas_active,        # (M_active,)  β_k  for k = 1 … M-1
+    betas_next,          # (M_active,)  β_{k+1}
+    t_idx_active,        # (M_active,)  rung indices k = 1 … M-1, matching betas_active
+    mcmc_params_active,  # HMCParameters pytree (leading axis M_active), SMC-tuned per rung
 ):
     """Run the full data-generation pipeline for all active temperature levels
     simultaneously via jax.vmap.
@@ -439,7 +626,8 @@ def _data_gen_parallel(
     """
     score_clip = train_cfg.score_clip  # Python constant; branch resolved at trace time
 
-    def process_one(sde_key, resample_key, mala_key, beta_k, beta_next, mala_h_k):
+    def process_one(sde_key, resample_key, mala_key, beta_k, beta_next,
+                     t_idx_k, mcmc_params_k):
         def control(x, t, b):
             s = score_net.apply(params, x, t, b)
             if score_clip > 0:
@@ -453,9 +641,10 @@ def _data_gen_parallel(
         # 2. Systematic resample
         resample_idx = systematic_resample(resample_key, log_w_path, n_particles)
         x0_resampled = x0_batch[resample_idx]
-        # 3. MALA rejuvenation
-        x0_rejuv, mala_acc = mala_rejuvenate(
-            mala_key, x0_resampled, beta_k, energy_fn, mala_h_k, n_mala_steps
+        # 3. MALA rejuvenation, using the same SMC-tuned kernel from Section 3
+        x0_rejuv, mala_acc = mppt_rejuvenate(
+            mala_key, x0_resampled, mppt_problem, beta_k, t_idx_k,
+            mcmc_params_k, n_mala_steps,
         )
         # 4. IS bridge weights (inlined to avoid passing through a nested-JIT boundary)
         delta_beta = beta_next - beta_k
@@ -467,17 +656,34 @@ def _data_gen_parallel(
         return x0_rejuv, bridge_lw, path_ess, mala_acc
 
     return jax.vmap(process_one)(
-        sde_keys, resample_keys, mala_keys, betas_active, betas_next, mala_hs_active
+        sde_keys, resample_keys, mala_keys, betas_active, betas_next,
+        t_idx_active, mcmc_params_active,
     )
 
 
 # %% [markdown]
-# ## 11. Per-Temperature Replay Buffers
+# ## 12. Per-Temperature Replay Buffers (Seeded from SMC)
 #
 # Each level $k$ maintains a fixed-capacity FIFO buffer of $(x,\log w)$ pairs.
-# Buffer 0 ($\beta=0$): i.i.d. $\mathcal{N}(0,I)$, frozen.
-# Buffer 1 ($\beta_1$): IS-reweighted buffer 0 via $w_{0\to1}$, frozen.
-# Buffers $2,\ldots,M$: filled during the outer loop.
+#
+# Buffer 0 ($\beta=0$): i.i.d. $\mathcal{N}(0,I)$, frozen. The reference *is* the
+# $\beta=0$ target, so exact draws beat SMC particles here.
+#
+# Buffers $1,\ldots,M$: seeded directly with this rung's **entire** SMC block —
+# the particles SMC itself already produced after its own reweight/resample/MALA
+# move at that rung (Section 3), with no further rejuvenation applied here.
+# Seed size, SMC population and buffer capacity are one number
+# (`n_smc_particles`), so each buffer starts exactly full and nothing is
+# subsampled away.
+# Buffers $2,\ldots,M$ additionally receive backward-SDE data during training,
+# and FIFO eviction retires the seed as that arrives — over
+# `n_smc_particles / n_particles` outer steps, since each step overwrites the
+# oldest $K$ rows in place.
+#
+# Seed particles are already $\approx \pi_{\beta_k}$, so they enter with
+# **uniform** log-weights — no bridge weights (those are for particles arriving
+# from the rung below). See `normalize_log_weights` in Section 10 for why every
+# block is normalized on the way in.
 
 # %%
 # Initialize all replay buffers
@@ -486,94 +692,50 @@ buffers: list[ReplayBuffer] = [
     for _ in range(len(betas_list))
 ]
 
-# Buffer 0: i.i.d. N(0, I) (frozen)
+# Buffer 0: exact i.i.d. N(0, I) (frozen). Filled to capacity rather than to
+# n_particles: it is never evicted, and exact draws are free, so leaving slots
+# empty would only narrow the β=0 training data for no reason.
 key, subkey = jax.random.split(key)
-buf0_samples = jax.random.normal(subkey, (train_cfg.n_particles, model_cfg.x_dim))
-buffers[0].add(buf0_samples, jnp.zeros(train_cfg.n_particles))
+buf0_samples = jax.random.normal(
+    subkey, (train_cfg.buffer_capacity, model_cfg.x_dim)
+)
+buffers[0].add(buf0_samples, jnp.zeros(train_cfg.buffer_capacity))
 buffers[0].freeze()
 print(f"Buffer 0 (β=0): {buffers[0].size} samples, uniform weights [frozen]")
 
-# Buffer 1: IS-reweighted buffer 0 → β_1 (frozen)
+# Buffers 1..M: the whole SMC block at the matching rung, no subsampling and no
+# further rejuvenation — SMC's own reweight/resample/MALA move (Section 3)
+# already produced these. The permutation below is not selection (it selects
+# everything) but ordering insurance: FIFO evicts in index order, so if the SMC
+# block ever carried lineage structure in its row order, the first K rows
+# retired would be a correlated subset rather than a random one.
+_n_seed = train_cfg.n_seed_particles
+assert _n_seed == smc_states.shape[1], (
+    f"seed size {_n_seed:,} must equal the SMC block size "
+    f"{smc_states.shape[1]:,} — both derive from n_smc_particles"
+)
+assert _n_seed <= train_cfg.buffer_capacity, (
+    f"seed {_n_seed:,} exceeds capacity {train_cfg.buffer_capacity:,}; "
+    f"ReplayBuffer.add would write duplicate indices and silently corrupt"
+)
+print(f"Seeding buffers directly from SMC output ({_n_seed:,} particles/rung) …")
+t0 = time.time()
+for _k in range(1, len(betas_list)):
+    key, subkey = jax.random.split(key)
+    _perm_seed = jax.random.permutation(subkey, smc_states.shape[1])[:_n_seed]
+    _seed_k = smc_states[_k][_perm_seed]
+    buffers[_k].add(_seed_k, jnp.zeros(_seed_k.shape[0]))
+    _frozen = " [frozen]" if _k == 1 else ""
+    print(f"  Buffer {_k} (β={float(betas[_k]):.3f}): {buffers[_k].size} samples{_frozen}")
+
+# Buffer 1 is never written during training (the outer loop fills 2..M), so it
+# stays frozen — but it now holds real π_{β_1} particles rather than buffer 0
+# reweighted, so its ESS starts at 1.0.
 if len(betas_list) >= 2:
-    lw1 = is_bridge_log_weights(buf0_samples, betas[0], betas[1])
-    buffers[1].add(buf0_samples, lw1)
     buffers[1].freeze()
-    ess1 = float(normalized_ess(lw1))
-    print(f"Buffer 1 (β={float(betas[1]):.3f}): {buffers[1].size} samples, ESS={ess1:.3f} [frozen]")
-
-print(f"Buffers 2..{len(betas_list)-1} start empty; filled during training.")
-
-# %% [markdown]
-# ## 12. MALA Step Size Calibration
-#
-# Before training, bisection finds a per-level step size $h_k$ such that
-# the MALA acceptance rate at $\pi_{\beta_k}$ lies in $[60\%,80\%]$.
-# Calibration particles are obtained by IS-resampling $\mathcal{N}(0,I)$
-# toward $\pi_{\beta_k}$.
-
-# %%
-_CALIB_N = 2_000          # particles used per level during calibration
-_CALIB_MALA_STEPS = 30    # MALA steps per bisection trial
-_CALIB_N_BISECT = 14      # bisection iterations (2^-14 ≈ 6e-5 resolution)
-_CALIB_H_LO = 1e-3
-_CALIB_H_HI = 2.0
-_CALIB_TARGET_LO = 0.60
-_CALIB_TARGET_HI = 0.80
-
-
-def calibrate_mala_h_for_level(key, particles, beta_k, energy_fn,
-                                target_lo=_CALIB_TARGET_LO,
-                                target_hi=_CALIB_TARGET_HI,
-                                h_lo=_CALIB_H_LO, h_hi=_CALIB_H_HI,
-                                n_bisect=_CALIB_N_BISECT):
-    """Bisect on h to achieve MALA acceptance in [target_lo, target_hi] at β_k.
-
-    Larger h → lower acceptance, so:
-      acc < target_lo  →  h is too big  →  tighten upper bound
-      acc > target_hi  →  h is too small →  raise lower bound
-    """
-    beta_arr = jnp.array(beta_k)
-    acc = 0.0
-    for _ in range(n_bisect):
-        h_mid = (h_lo + h_hi) / 2.0
-        key, subkey = jax.random.split(key)
-        _, acc_arr = mala_rejuvenate(
-            subkey, particles, beta_arr, energy_fn,
-            jnp.array(h_mid), _CALIB_MALA_STEPS,
-        )
-        acc = float(acc_arr)
-        if acc < target_lo:
-            h_hi = h_mid
-        elif acc > target_hi:
-            h_lo = h_mid
-        else:
-            break
-    return (h_lo + h_hi) / 2.0, acc
-
-
-# %%
-print("Calibrating per-level MALA step sizes …")
-key, subkey = jax.random.split(key)
-_ref_calib = jax.random.normal(subkey, (_CALIB_N, model_cfg.x_dim))
-
-mala_hs_list = []
-for _k, _beta_k in enumerate(betas_list):
-    # IS-resample from N(0,I) toward π_{β_k} for approximate calibration particles
-    _lw_calib = is_bridge_log_weights(_ref_calib, betas[0], betas[_k])
-    key, subkey = jax.random.split(key)
-    _idx_calib = systematic_resample(subkey, _lw_calib, _CALIB_N)
-    _particles_calib = _ref_calib[_idx_calib]
-
-    key, subkey = jax.random.split(key)
-    _h_k, _acc_k = calibrate_mala_h_for_level(
-        subkey, _particles_calib, float(_beta_k), target.energy
-    )
-    mala_hs_list.append(_h_k)
-    print(f"  β_{_k}={float(_beta_k):.3f}:  h={_h_k:.5f},  acceptance={_acc_k:.3f}")
-
-mala_hs = jnp.array(mala_hs_list)
-print(f"\nCalibrated step sizes (all {len(mala_hs_list)} levels): "
-      f"{[f'{h:.4f}' for h in mala_hs_list]}")
+print(f"Seeding done in {time.time()-t0:.1f}s")
+print(f"Buffers 2..{len(betas_list)-1} additionally receive backward-SDE data "
+      f"during training.")
 
 # %% [markdown]
 # ## 13. Training Loop
@@ -627,7 +789,10 @@ def train_step(params, opt_state, x0_all, t_all, beta_all, key):
 
 # %%
 def periodic_eval_plot(params, outer_step):
-    """Plot model 1-D marginal and buffer[M] quality every eval_every outer steps."""
+    """Same three candidate sample sets as the final evaluation (Section 14) —
+    raw backward-SDE output, IS-resampled backward-SDE output, and buffer[M] —
+    minus the loss-curve column, which belongs to the end-of-run figure only.
+    """
     global key
 
     # Run backward SDE at β=1 (same settings as end-of-training eval)
@@ -638,9 +803,33 @@ def periodic_eval_plot(params, outer_step):
         train_cfg.T, train_cfg.n_sde_steps_eval,
     )
     ess_eval = float(normalized_ess(lw_eval))
+
+    # (1) Raw backward-SDE output: the network alone, no correction.
+    x_raw = x0_eval
+
+    # (2) Same particles, IS-corrected by the path-space weights.
     key, subkey = jax.random.split(key)
     resamp_idx = systematic_resample(subkey, lw_eval, len(lw_eval))
     x_resamp = x0_eval[resamp_idx]
+
+    # (3) buffer[M]: the training data at β=1, drawn the way the inner loop
+    # draws it — systematic resampling on the stored IS weights.
+    if buffers[M].is_ready(1):
+        key, subkey = jax.random.split(key)
+        n_buf = min(train_cfg.n_eval_particles, buffers[M].size)
+        x_buf, _ = buffers[M].sample(subkey, n_buf)
+        buf_ess = float(normalized_ess(buffers[M].log_weights[: buffers[M].size]))
+    else:
+        x_buf, buf_ess = None, float("nan")
+
+    sample_sets = [
+        ("Backward SDE (raw, no IS)", "SDE raw", x_raw,
+         f"unweighted, {x_raw.shape[0]:,} particles"),
+        ("Backward SDE + IS resample", "SDE + IS", x_resamp,
+         f"path ESS={ess_eval:.3f}  (≈{ess_eval * x_raw.shape[0]:,.0f} eff.)"),
+        (f"buffer[M]  β={float(betas[M]):.3f}", "buffer[M]", x_buf,
+         f"buffer ESS={buf_ess:.3f}" if x_buf is not None else "empty"),
+    ]
 
     # True GMM density (matches target definition)
     xs_1d = jnp.linspace(-4, 6, 300)
@@ -650,32 +839,33 @@ def periodic_eval_plot(params, outer_step):
         + _w2 * jnp.exp(-0.5 * ((xs_1d - _mu2) / _sigma) ** 2) / (_sigma * (2 * jnp.pi) ** 0.5)
     )
 
-    fig, axes = plt.subplots(1, 2, figsize=(12, 4))
+    # Shared bin edges and y-limit so the three panels are read against each
+    # other, not each against its own auto-scaled axis.
+    _bins = np.linspace(-4, 6, 61)
+    fig, axes = plt.subplots(1, 3, figsize=(16, 4))
+    for ax, (_label, _short, _x, _sub) in zip(axes, sample_sets):
+        if _x is None:
+            ax.text(0.5, 0.5, "buffer[M] empty", ha="center", va="center",
+                    transform=ax.transAxes, color=C_INK_2, fontsize=10)
+            ax.set_title(_label, color=C_INK, fontsize=10)
+            continue
+        ax.hist(np.asarray(_x[:, 0]), bins=_bins, density=True,
+                histtype="step", linewidth=1.5, color=C_TEST, label=_short)
+        ax.plot(xs_1d, pdf_true, color=C_REF, linestyle="--", lw=1.5,
+                label="True GMM")
+        ax.set_xlabel("$x_1$", color=C_INK_2, fontsize=10)
+        ax.set_ylabel("density", color=C_INK_2, fontsize=10)
+        ax.set_title(f"{_label}\n{_sub}", color=C_INK, fontsize=10)
+        ax.set_xlim(-4, 6)
+        ax.legend(fontsize=8, frameon=False, labelcolor=C_INK)
+        style_axis(ax)
 
-    # Left: backward SDE model samples
-    axes[0].hist(x_resamp[:, 0].tolist(), bins=60, density=True, alpha=0.4, label="Model (IS resampled)")
-    axes[0].plot(xs_1d, pdf_true, "r-", lw=2, label="True GMM")
-    axes[0].set_xlabel("$x_1$")
-    axes[0].set_ylabel("density")
-    axes[0].set_title(f"Step {outer_step+1}: model 1-D marginal  ESS={ess_eval:.3f}")
-    axes[0].legend()
+    _ymax = max(ax.get_ylim()[1] for ax in axes)
+    for ax in axes:
+        ax.set_ylim(0, _ymax)
 
-    # Right: buffer[M] weighted samples
-    if buffers[M].is_ready(1):
-        n_buf = min(train_cfg.n_eval_particles, buffers[M].size)
-        key, subkey = jax.random.split(key)
-        x_buf, _ = buffers[M].sample(subkey, n_buf)
-        axes[1].hist(x_buf[:, 0].tolist(), bins=60, density=True, alpha=0.4, label="buffer[M] (IS resampled)")
-        axes[1].plot(xs_1d, pdf_true, "r-", lw=2, label="True GMM")
-        axes[1].set_title(f"Step {outer_step+1}: buffer[M] 1-D marginal  β={float(betas[M]):.3f}")
-    else:
-        axes[1].text(0.5, 0.5, "buffer[M] not yet filled", ha="center", va="center",
-                     transform=axes[1].transAxes)
-        axes[1].set_title(f"Step {outer_step+1}: buffer[M] (empty)")
-    axes[1].set_xlabel("$x_1$")
-    axes[1].set_ylabel("density")
-    axes[1].legend()
-
+    fig.suptitle(f"Step {outer_step+1}: three candidate sample sets vs true GMM  "
+                 f"(path ESS={ess_eval:.3f})", color=C_INK, fontsize=12)
     plt.tight_layout()
     fname = EVAL_FIGURES_DIR / f"eval_step{outer_step+1:04d}.png"
     fig.savefig(fname, dpi=150)
@@ -745,21 +935,33 @@ for outer_step in range(start_outer_step, train_cfg.num_outer_steps):
         resamp_keys = all_keys[M_active + 1 : 2 * M_active + 1]
         mala_keys   = all_keys[2 * M_active + 1:]
 
+        # Active rungs are k = 1 … M-1 (M_active of them); mcmc_params_by_rung[k-1]
+        # is the HMCParameters SMC tuned for rung k (Section 3), so slice its
+        # first M_active entries to match betas[1:-1].
+        t_idx_active = jnp.arange(1, M)
+        mcmc_params_active = jax.tree_util.tree_map(
+            lambda leaf: leaf[:M_active], mcmc_params_by_rung
+        )
+
         x0_rejuv_all, bridge_lw_all, path_ess_all, _ = _data_gen_parallel(
             sde_keys, resamp_keys, mala_keys,
             target.energy,
             model_cfg.x_dim, train_cfg.n_particles,
             train_cfg.T, train_cfg.n_sde_steps_train,
             train_cfg.n_mala_rejuv,
+            mppt_problem,
             params, betas[1:-1], betas[2:],
-            mala_hs[1:-1],
+            t_idx_active, mcmc_params_active,
         )
 
         outer_ess_list = path_ess_all.tolist()
 
         # Buffer writes are Python-level mutations; negligible vs. SDE/MALA compute.
         for i in range(M_active):
-            buffers[i + 2].add(x0_rejuv_all[i], bridge_lw_all[i])
+            # Normalize each block on the way in so it is commensurable with
+            # the uniform-weight SMC seed already in the buffer, and with
+            # blocks written at earlier outer steps (Section 10).
+            buffers[i + 2].add(x0_rejuv_all[i], normalize_log_weights(bridge_lw_all[i]))
 
     # ---- Inner loop: gradient descent ----
     all_buffers_ready = all(
@@ -846,8 +1048,27 @@ print(f"\nTraining complete in {time.time()-train_start:.1f}s")
 # ## 14. Evaluation
 #
 # Runs the backward SDE at $\beta=1$ with $N=100\,000$ particles and 2000
-# steps. Path-space IS weights are used to resample, then the 1-D marginal
-# of $x_1$ is compared to the true GMM density via KDE.
+# steps, then compares **three** candidate definitions of "our method's
+# samples" against the true GMM marginal:
+#
+# | # | Sample set | What it isolates |
+# |---|---|---|
+# | 1 | Backward SDE output, **no** reweighting | the learned score alone |
+# | 2 | Same run, IS-resampled on the path weights | score **+** path-space correction |
+# | 3 | `buffer[M]`, IS-resampled on its stored weights | the training data at $\beta=1$ |
+#
+# (1) and (2) come from **one** SDE run — they are the same particles, differing
+# only in whether `log w_path` is applied — so any gap between them is exactly
+# the work the importance correction is doing. If they agree, the network has
+# genuinely learned the target; if only (2) matches, the result is being carried
+# by the reweighting and `ess_eval` says how few particles are really behind it.
+#
+# (3) needs no SDE run at all: it is what the outer loop deposited at the top
+# rung, which is what the inner loop actually trained on. It bounds what the
+# network could have learned — a network cannot beat its own training data.
+#
+# All three are drawn through `systematic_resample` except (1), which is by
+# definition the unweighted draw.
 
 # %%
 def eval_samples(params, n_eval=None):
@@ -870,37 +1091,86 @@ x_eval, lw_eval, ess_eval = eval_samples(params)
 print(f"Evaluation ESS (path-space, β=1): {ess_eval:.3f}")
 
 # %%
-# 1-D marginal KDE for first coordinate
-fig, axes = plt.subplots(1, 2, figsize=(12, 4))
+# ---- The three candidate sample sets ----
+# (1) and (2) share the single SDE run above; only (2) applies log w_path.
 
-# Weighted KDE of model samples
+# (1) Raw backward-SDE output: the network alone, no correction whatsoever.
+x_raw = x_eval
+
+# (2) Same particles, IS-corrected by the path-space weights.
 key, subkey = jax.random.split(key)
 resamp_idx = systematic_resample(subkey, lw_eval, len(lw_eval))
 x_resamp = x_eval[resamp_idx]
 
-axes[0].hist(x_resamp[:, 0].tolist(), bins=60, density=True, alpha=0.4, label="Model samples (IS)")
-# True GMM marginal
+# (3) buffer[M]: the training data at β=1, drawn the same way the inner loop
+# draws it — systematic resampling on the stored IS weights. Raw buffer
+# contents would NOT be π-distributed: the blocks arriving from the outer loop
+# are ≈ π_{β_{M-1}} particles carrying bridge weights to β_M, and only become
+# ≈ π once those weights are applied. `.sample()` applies them.
+if buffers[M].is_ready(1):
+    key, subkey = jax.random.split(key)
+    n_buf = min(train_cfg.n_eval_particles, buffers[M].size)
+    x_buf, _ = buffers[M].sample(subkey, n_buf)
+    buf_ess = float(normalized_ess(buffers[M].log_weights[: buffers[M].size]))
+else:
+    x_buf, buf_ess = None, float("nan")
+
+# (long label for the figure, short label for the table, samples, subtitle)
+sample_sets = [
+    ("Backward SDE (raw, no IS)", "SDE raw", x_raw,
+     f"unweighted, {x_raw.shape[0]:,} particles"),
+    ("Backward SDE + IS resample", "SDE + IS", x_resamp,
+     f"path ESS={ess_eval:.3f}  (≈{ess_eval * x_raw.shape[0]:,.0f} eff.)"),
+    (f"buffer[M]  β={float(betas[M]):.3f}", "buffer[M]", x_buf,
+     f"buffer ESS={buf_ess:.3f}" if x_buf is not None else "empty"),
+]
+
+# %%
+# 1-D marginal of x_1 for each sample set, plus the training loss curve.
+fig, axes = plt.subplots(1, 4, figsize=(20, 4))
+
+# True GMM marginal (shared reference curve across all three panels)
 xs_1d = jnp.linspace(-4, 6, 300)
 w1, w2 = 0.2, 0.8
 mu1, mu2, sigma = -1.5, 2.5, 0.5
 pdf_true = (w1 * jnp.exp(-0.5*((xs_1d-mu1)/sigma)**2) / (sigma*(2*jnp.pi)**0.5)
            + w2 * jnp.exp(-0.5*((xs_1d-mu2)/sigma)**2) / (sigma*(2*jnp.pi)**0.5))
-axes[0].plot(xs_1d, pdf_true, "r-", lw=2, label="True GMM")
-axes[0].set_xlabel("$x_1$")
-axes[0].set_ylabel("density")
-axes[0].set_title(f"1-D marginal: model vs target (GMM in {model_cfg.x_dim} dimensions)")
-axes[0].legend()
 
-# Training loss curve
+# Shared bin edges and y-limit so the three panels are read against each other,
+# not each against its own auto-scaled axis.
+_bins = np.linspace(-4, 6, 61)
+for ax, (_label, _short, _x, _sub) in zip(axes, sample_sets):
+    if _x is None:
+        ax.text(0.5, 0.5, "buffer[M] empty", ha="center", va="center",
+                transform=ax.transAxes, color=C_INK_2, fontsize=10)
+        ax.set_title(_label, color=C_INK, fontsize=10)
+        continue
+    ax.hist(np.asarray(_x[:, 0]), bins=_bins, density=True,
+            histtype="step", linewidth=1.5, color=C_TEST, label=_short)
+    ax.plot(xs_1d, pdf_true, color=C_REF, linestyle="--", lw=1.5,
+            label="True GMM")
+    ax.set_xlabel("$x_1$", color=C_INK_2, fontsize=10)
+    ax.set_ylabel("density", color=C_INK_2, fontsize=10)
+    ax.set_title(f"{_label}\n{_sub}", color=C_INK, fontsize=10)
+    ax.set_xlim(-4, 6)
+    ax.legend(fontsize=8, frameon=False, labelcolor=C_INK)
+    style_axis(ax)
+
+_ymax = max(ax.get_ylim()[1] for ax in axes[:3])
+for ax in axes[:3]:
+    ax.set_ylim(0, _ymax)
+
+# Training loss curve (own axis — shares no units with the marginals)
 if loss_history:
-    axes[1].plot(loss_history)
-    axes[1].set_xlabel("outer step")
-    axes[1].set_ylabel("DDPM loss")
-    axes[1].set_title("Training loss")
-    axes[1].set_yscale("log")
+    axes[3].plot(loss_history, color=C_TEST, linewidth=1.5)
+    axes[3].set_xlabel("outer step", color=C_INK_2, fontsize=10)
+    axes[3].set_ylabel("DDPM loss", color=C_INK_2, fontsize=10)
+    axes[3].set_title("Training loss", color=C_INK, fontsize=10)
+    axes[3].set_yscale("log")
+    style_axis(axes[3])
 else:
-    axes[1].text(0.5, 0.5, "No loss history", ha="center", va="center",
-                 transform=axes[1].transAxes)
+    axes[3].text(0.5, 0.5, "No loss history", ha="center", va="center",
+                 transform=axes[3].transAxes, color=C_INK_2, fontsize=10)
 
 plt.tight_layout()
 fig.savefig(FIGURES_DIR / "gmm_marginal_and_loss.png", dpi=150)
@@ -908,25 +1178,26 @@ plt.close(fig)
 print(f"Figure saved to {FIGURES_DIR / 'gmm_marginal_and_loss.png'}")
 
 # %%
-# Per-dimension mean and std
-means_eval = jnp.mean(x_resamp, axis=0)
-stds_eval = jnp.std(x_resamp, axis=0)
-# True GMM mean and std
+# Per-dimension mean and std, for each of the three sample sets
 true_mean = w1 * mu1 + w2 * mu2
 true_var = w1*(mu1**2 + sigma**2) + w2*(mu2**2 + sigma**2) - true_mean**2
 true_std = true_var ** 0.5
 
 print(f"\nTrue GMM per-dim: mean={true_mean:.4f}, std={true_std:.4f}")
-print(f"Model per-dim (mean over 16 dims): mean={float(jnp.mean(means_eval)):.4f}, "
-      f"std={float(jnp.mean(stds_eval)):.4f}")
+for _label, _short, _x, _ in sample_sets:
+    if _x is None:
+        continue
+    print(f"  {_label:<32} mean={float(jnp.mean(jnp.mean(_x, axis=0))):>8.4f}  "
+          f"std={float(jnp.mean(jnp.std(_x, axis=0))):>8.4f}")
 
 # %%
 # Temperature ladder ESS diagnostics
 fig, ax = plt.subplots(figsize=(8, 4))
-ax.bar(range(len(betas_list)), betas_list, alpha=0.7)
-ax.set_xlabel("Temperature level k")
-ax.set_ylabel("β_k")
-ax.set_title(f"Temperature ladder ({len(betas_list)} levels)")
+ax.bar(range(len(betas_list)), betas_list, color=C_TEST, alpha=0.85)
+ax.set_xlabel("Temperature level k", color=C_INK_2, fontsize=10)
+ax.set_ylabel("β_k", color=C_INK_2, fontsize=10)
+ax.set_title(f"Temperature ladder ({len(betas_list)} levels)", color=C_INK, fontsize=11)
+style_axis(ax)
 plt.tight_layout()
 fig.savefig(FIGURES_DIR / "gmm_temperature_ladder.png", dpi=150)
 plt.close(fig)
@@ -950,7 +1221,6 @@ print(f"\nTemperature ladder: {[f'{b:.3f}' for b in betas_list]}")
 # | Median, Q1, Q3 | Quantiles are especially sensitive to the 0.2/0.8 weight split |
 
 # %%
-import numpy as np
 from scipy.integrate import quad as _quad
 from scipy.optimize import brentq as _brentq
 
@@ -972,32 +1242,37 @@ _gt_median  = _brentq(lambda x: _cdf(x) - 0.50, -10, 10)
 _gt_q1      = _brentq(lambda x: _cdf(x) - 0.25, -10, 10)
 _gt_q3      = _brentq(lambda x: _cdf(x) - 0.75, -10, 10)
 
-# ── Model estimates (IS-resampled samples, averaged over all 16 i.i.d. dims) ──
-_x = np.array(x_resamp).ravel()   # (n_eval_particles * dim,)
-_m_mean    = float(_x.mean())
-_m_std     = float(_x.std())
-_m_ex2     = float((_x**2).mean())
-_m_eabs    = float(np.abs(_x).mean())
-_m_esinpix = float(np.sin(np.pi * _x).mean())
-_m_median  = float(np.median(_x))
-_m_q1      = float(np.percentile(_x, 25))
-_m_q3      = float(np.percentile(_x, 75))
-
-# ── Print table ───────────────────────────────────────────────────────────────
-_rows = [
-    ("E[X]  (mean)",       _m_mean,    _gt_mean),
-    ("std(X)",             _m_std,     _gt_std),
-    ("E[X²]",              _m_ex2,     _gt_ex2),
-    ("E[|X|]",             _m_eabs,    _gt_eabs),
-    ("E[sin(πX)]",         _m_esinpix, _gt_esinpix),
-    ("Median",             _m_median,  _gt_median),
-    ("Q1 (25th pct)",      _m_q1,      _gt_q1),
-    ("Q3 (75th pct)",      _m_q3,      _gt_q3),
+# ── Functionals, evaluated on any sample set (all 16 dims pooled — they are
+#    i.i.d. under this factorised target, so pooling is legitimate) ───────────
+_FUNCTIONALS = [
+    ("E[X]  (mean)",  lambda v: float(v.mean()),                 _gt_mean),
+    ("std(X)",        lambda v: float(v.std()),                  _gt_std),
+    ("E[X²]",         lambda v: float((v**2).mean()),            _gt_ex2),
+    ("E[|X|]",        lambda v: float(np.abs(v).mean()),         _gt_eabs),
+    ("E[sin(πX)]",    lambda v: float(np.sin(np.pi*v).mean()),   _gt_esinpix),
+    ("Median",        lambda v: float(np.median(v)),             _gt_median),
+    ("Q1 (25th pct)", lambda v: float(np.percentile(v, 25)),     _gt_q1),
+    ("Q3 (75th pct)", lambda v: float(np.percentile(v, 75)),     _gt_q3),
 ]
-print(f"\n── Diagnostics ({x_resamp.shape[0]}×{x_resamp.shape[1]} samples, averaged over dims) ──")
-print(f"  {'Functional':<20}  {'Model':>10}  {'Ground truth':>12}  {'|error|':>9}")
-print("  " + "─" * 57)
-for _name, _mv, _tv in _rows:
-    print(f"  {_name:<20}  {_mv:>10.4f}  {_tv:>12.4f}  {abs(_mv-_tv):>9.4f}")
+
+_active = [(short, np.asarray(x).ravel())
+           for _, short, x, _ in sample_sets if x is not None]
+
+# ── Print table: one column per sample set, ground truth on the right ─────────
+print(f"\n── Diagnostics: three candidate sample sets vs ground truth ──")
+for _lbl, _short, _x, _sub in sample_sets:
+    if _x is not None:
+        print(f"    {_short:<10} {_lbl:<30} {_x.shape[0]:>7,}×{_x.shape[1]}   {_sub}")
+print()
+_hdr = "  " + f"{'Functional':<16}" + "".join(f"{lbl:>24}" for lbl, _ in _active)
+print(_hdr + f"{'Ground truth':>14}")
+print("  " + "─" * (16 + 24 * len(_active) + 14))
+for _name, _fn, _tv in _FUNCTIONALS:
+    _cells = ""
+    for _lbl, _v in _active:
+        _mv = _fn(_v)
+        _cells += f"{_mv:>14.4f}{'(' + format(abs(_mv - _tv), '.4f') + ')':>10}"
+    print(f"  {_name:<16}" + _cells + f"{_tv:>14.4f}")
+print(f"\n  Each cell: estimate (|error| vs ground truth).")
 print()
 

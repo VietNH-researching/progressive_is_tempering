@@ -4,6 +4,7 @@ from functools import partial
 from numbers import Integral, Real
 from typing import Union
 
+import jax
 from mppt.abstract.mcmc import batch_init_extend
 from mppt.abstract.pt_concept import PTProblem, PTState
 from jax import Array, random, lax, numpy as jnp, jit, vmap, block_until_ready
@@ -309,7 +310,7 @@ def _compile_all(compact_step, full_step, smc_init, cold_init):
     print('Compilation done.')
     return compact_step, full_step, smc_init, cold_init
 
-def smc_sampler(key, problem: PTProblem, n_particles, engine, n_mcmc_steps, local_ess_ratio, verbose, runtime_check, keep_all_states=False):
+def smc_sampler(key, problem: PTProblem, n_particles, engine, n_mcmc_steps, local_ess_ratio, verbose, runtime_check, keep_all_states=False, keep_mcmc_params=False):
     r"""SMC sampler that anneals from t=0 to t=1 with adaptive temperature
     schedule. At each step: find next temperature via ESS-based bisection,
     resample, run MCMC, estimate local logZ. Temperatures are chosen so that
@@ -318,7 +319,14 @@ def smc_sampler(key, problem: PTProblem, n_particles, engine, n_mcmc_steps, loca
     :param keep_all_states: if True, return all intermediate particle positions
     as a stacked array (shape: n_steps+1, n_particles, d); otherwise return
     only the final particles.
-    :return: (particles, logZ_dict, temperatures_list)
+    :param keep_mcmc_params: if True, additionally return the per-rung adapted
+    MCMC parameters (e.g. ``HMCParameters``, stacked over a leading axis) as a
+    4th return value. Entry ``k-1`` of the stack is the parameters adapted and
+    used for the move into rung ``k`` (``k = 1, ..., len(temperatures_list)-1``);
+    rung 0 has no associated MCMC move. Off by default to keep the return shape
+    backward compatible.
+    :return: (particles, logZ_dict, temperatures_list) or, if
+    ``keep_mcmc_params=True``, (particles, logZ_dict, temperatures_list, mcmc_params)
 
     When ``verbose=True``, each iteration prints:
 
@@ -358,10 +366,11 @@ def smc_sampler(key, problem: PTProblem, n_particles, engine, n_mcmc_steps, loca
     logZ_ret = defaultdict(float)   # cumulative log(Z_t / Z_0) per estimator
     all_temperatures = [0.]
     all_states = [x.position]
+    all_mcmc_params = []
     header_printed = False
     while not jnp.allclose(x.temperature, 1):
         key, subkey = random.split(key)
-        x, logZ_local, niter_mcmc = mover(subkey, x)
+        x, logZ_local, niter_mcmc, mcmc_params = mover(subkey, x)
         for _k, _v in logZ_local.items():
             logZ_ret[_k] += _v
         if verbose:
@@ -380,6 +389,8 @@ def smc_sampler(key, problem: PTProblem, n_particles, engine, n_mcmc_steps, loca
         all_temperatures.append(x.temperature[0])
         if keep_all_states:
             all_states.append(x.position)
+        if keep_mcmc_params:
+            all_mcmc_params.append(mcmc_params)
 
     if verbose:
         est_order = ', '.join(logZ_ret.keys())
@@ -388,4 +399,9 @@ def smc_sampler(key, problem: PTProblem, n_particles, engine, n_mcmc_steps, loca
 
     if keep_all_states:
         x = jnp.array(all_states)
+    if keep_mcmc_params:
+        mcmc_params_stacked = jax.tree_util.tree_map(
+            lambda *leaves: jnp.stack(leaves), *all_mcmc_params
+        )
+        return x, logZ_ret, all_temperatures, mcmc_params_stacked
     return x, logZ_ret, all_temperatures

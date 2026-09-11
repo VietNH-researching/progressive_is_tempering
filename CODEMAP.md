@@ -31,7 +31,8 @@ progressive_is_tempering/          # repo root
 │   │   ├── score_network.py
 │   │   └── egnn_jax.py
 │   └── utils/
-│       └── __init__.py
+│       ├── __init__.py
+│       └── smc_diagnostics.py     # SMC seed-quality / degeneracy diagnostics
 │
 ├── notebooks/
 │   ├── gmm/                       # GMM experiment
@@ -40,6 +41,9 @@ progressive_is_tempering/          # repo root
 │   ├── dw4/                       # DW4 molecule experiment
 │   │   ├── dw4.py
 │   │   └── dw4.ipynb
+│   ├── phi4/                      # phi^4 lattice field theory experiment
+│   │   ├── phi4.py
+│   │   └── phi4.ipynb
 │   └── templates/minimal.py       # minimal training loop template
 │
 ├── tests/                         # pytest suite
@@ -105,6 +109,8 @@ Unnormalized target distributions. Each target exposes `energy(x)`, `log_prob(x)
 |---|---|
 | `GMMTarget` | Factorized GMM over ℝᵈ; each coordinate iid from the same 1-D mixture |
 | `make_gmm_target(dim, means, weights, std)` | Constructs default GMM (d=16, μ=(-1.5, 2.5), w=(0.2, 0.8), σ=0.5) |
+| `Phi4Target` | 1D phi^4 lattice field theory, wrapping `jax_pdf.PhiFour`; normalizing constant is intractable (no closed-form `log_prob`) |
+| `make_phi4_target(dim, a, b, inv_temp, periodic)` | Constructs default phi^4 field (d=100, a=0.1, b=0.0, inv_temp=20.0, Dirichlet BC) |
 
 ---
 
@@ -209,6 +215,27 @@ Architecture: `concat([x, time_embedding(t), time_embedding(β)])` → `ResMLP`.
 ### `net/egnn_jax.py`
 
 Equivariant Graph Neural Network backbone for molecular targets (DW4). Used in place of `ScoreNetwork` when SE(3) equivariance is required.
+
+---
+
+### `utils/smc_diagnostics.py`
+
+SMC seed-quality diagnostics, shared by all three notebooks. Catches two failure modes of the top-rung SMC block, which are not the same thing.
+
+| Symbol | Description |
+|---|---|
+| `smc_seed_quality_figure(...)` | Standard four-panel figure; returns `(fig, stats)` |
+| `print_seed_quality_report(stats)` | Prints the numbers behind the figure |
+| `exchangeable_degeneracy(features_test, features_ref, threshold)` | Implied independent-particle count from the spread of per-feature exceedance probabilities |
+| `plot_value_comparison(ax, v_test, v_ref, ...)` | Test-vs-reference density on shared bin edges |
+| `reference_anchored_window`, `honest_density_hist` | Window that always shows the reference in full; step histogram whose area is the in-window sample fraction |
+| `style_axis`, `C_TEST`, `C_REF`, `C_INK`, `C_INK_2` | Shared styling; colour follows the entity, not the panel |
+
+**Distributional mismatch** is caught by the pooled-statistic and energy panels. **Ancestral degeneracy** — a population whose histograms match perfectly while carrying far less independent information than its particle count suggests — is caught by the per-feature panels. A distinct-row count reports 100% unique and misses it entirely, because local MCMC erases literal duplicates while the basin assignment stays frozen.
+
+The degeneracy test needs **exchangeable scalar features**: the `d` coordinates for GMM (i.i.d. under a factorised target), the `C(n,2)` pairwise distances for DW4/LJ13 (particle-permutation symmetry). The reference set is passed through the identical computation as a control — being i.i.d., its implied count should come back near its own size. **Read `n_eff_ref` before trusting `n_eff_test`:** the estimator is noisy when there are few features (DW4 has only 6).
+
+Only NumPy is needed for the statistics; matplotlib and scipy are imported lazily, so importing the module never requires them.
 
 ---
 

@@ -12,12 +12,14 @@ _KNOWN_LOGZ_ESTIMATORS = ('SMC_like', 'robust', 'reverse_logistic')
 
 class OneStepSMCResult(NamedTuple):
     r"""Output of one SMC step: the resampled-and-moved particles at the new
-    temperature, local log-normalizing-constant estimates, and the number of
-    MCMC steps used.
+    temperature, local log-normalizing-constant estimates, the number of
+    MCMC steps used, and the MCMC parameters (step size / covariance) that were
+    adapted and used for the move at this rung.
     """
     xnext: PTParticles
     logZ_local: dict[str, Float]  # local log Z estimated by different methods
     niter_mcmc: int
+    mcmc_params: object  # adapted MCMC parameters (e.g. HMCParameters) for this rung
 
     @property
     def t(self):
@@ -137,7 +139,7 @@ def one_step_smc(key, x: PTParticles, problem: PTProblem, mcmc_engine: PTMCMCEng
     key, subkey = random.split(key)
     logZ = _get_logZ(subkey, x, x_next, x.temperature[0], t_next, logZ_estimators)
 
-    return OneStepSMCResult(x_next, logZ, niter_mcmc)
+    return OneStepSMCResult(x_next, logZ, niter_mcmc, mcmc_params)
 
 def _get_logZ(key, x: PTParticles, x_next: PTParticles, t, t_next, logZ_estimators):
     r"""Estimate the local log-normalizing constant between temperatures t and

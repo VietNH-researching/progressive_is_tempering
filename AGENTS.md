@@ -69,7 +69,8 @@ progressive_is_tempering/          # repo root
 │   │   ├── score_network.py       # ScoreNetwork: β-conditioned excess-score model
 │   │   └── egnn_jax.py            # EGNN backbone for equivariant (molecular) targets
 │   └── utils/
-│       └── __init__.py            # shared utilities (no imports from core package)
+│       ├── __init__.py            # shared utilities (no imports from core package)
+│       └── smc_diagnostics.py     # SMC seed-quality + ancestral-degeneracy diagnostics
 ├── notebooks/
 │   ├── gmm/                       # GMM experiment (gmm.py + gmm.ipynb)
 │   ├── dw4/                       # DW4 molecule experiment (dw4.py + dw4.ipynb)
@@ -82,7 +83,8 @@ progressive_is_tempering/          # repo root
 │   ├── test_buffer.py
 │   ├── test_loss.py
 │   ├── test_targets.py
-│   └── test_score_network.py
+│   ├── test_score_network.py
+│   └── test_smc_diagnostics.py
 ├── data/                          # reference data for sampling benchmarks
 │   └── dw4_samples.npz            # ground-truth DW4 particle samples
 ├── figures/                       # saved plot outputs (gitignored binaries)
@@ -123,14 +125,18 @@ from higher layers.
 
 **Warmup** (once, before any gradient steps)
 
-1. **Temperature ladder** — call MPPT `smc_sampler` with `PTProblem(rvs_ref, logpdf_ref, logpdf_final_target)` to adaptively find `{β_k}` (local ESS ratio ≥ 0.5). Optionally follow with one round of `pt_manual_runners` to refine the particle cloud. Only the ladder values `betas` are kept; the SMC particles are discarded.
+1. **Temperature ladder** — call MPPT `smc_sampler` with `PTProblem(rvs_ref, logpdf_ref, logpdf_final_target)` and `keep_all_states=True` to adaptively find `{β_k}` (local ESS ratio ≥ 0.5). Keep **both** returns: the ladder `betas`, and the `(M+1, N, d)` stack of particle blocks, one per rung, indexed to match `betas`. Do **not** follow with `pt_manual_runners` — the ladder comes from SMC and the PT state is not read by anything downstream, so the call is pure eager-JIT cost.
 
-2. **Buffer initialization**
-   - `buffer[0]`: fill with i.i.d. `N(0, I)` samples, log-weights `= 0` (uniform). Frozen for the entire run.
-   - `buffer[1]`: IS-reweight `buffer[0]` samples to `β_1` using `ReplayBuffer.is_bridge_log_weights`. Frozen.
-   - `buffer[2..M]`: start empty; filled during the outer loop.
+   MPPT's MCMC engines do not project to the zero-CoM subspace. For molecular targets, project the SMC stack once at this boundary before any downstream use.
 
-3. **MALA step-size calibration** — for each level `k`, IS-resample `N(0, I)` particles toward `π_{β_k}`, then bisect on `h` (14 iterations, range `[1e-3, 2.0]`) until MALA acceptance ∈ `[60%, 80%]`. Stores one float `h_k` per level; passed as `mala_hs[1:-1]` to the outer vmap.
+2. **MALA step-size calibration** — for each level `k`, bisect on `h` (14 iterations, range `[1e-3, 2.0]`) until MALA acceptance ∈ `[60%, 80%]`, using **that rung's SMC block** as the calibration set. Do not calibrate on particles IS-resampled in one shot from `β_0` straight to `β_k`: that bridge skips the whole ladder, collapses to a handful of distinct configurations at the upper rungs, and tunes `h_k` to one atypical point. Stores one float `h_k` per level; passed as `mala_hs[1:-1]` to the outer vmap.
+
+3. **Buffer initialization**
+   - `buffer[0]`: fill with i.i.d. `N(0, I)` samples, log-weights `= 0` (uniform). Frozen for the entire run. Use exact draws, not the SMC `β=0` block — at `β_0 = 0` the reference is the target.
+   - `buffer[1..M]`: seed with that rung's SMC block after `n_mala_seed` steps of MALA at the calibrated `h_k`. Uniform log-weights — these particles are already `≈ π_{β_k}`, so bridge weights do **not** apply. `buffer[1]` is frozen (the outer loop writes only `2..M`).
+   - `buffer[2..M]`: additionally filled during the outer loop; FIFO retires the seed as new data arrives.
+
+   Calibration must run **before** buffer initialization, since seeding needs `h_k`.
 
 **Outer loop** (one iteration = one SMC data-generation pass)
 
@@ -141,7 +147,7 @@ All `M_active = M - 1` active levels (`k = 1 … M-1`) are processed in parallel
 3. `mala_rejuvenate(particles, β_k, h_k, n_mala_steps)` → diversified particles, acceptance rate.
 4. `ReplayBuffer.is_bridge_log_weights(x0_rejuv, β_k, β_{k+1})` → IS log-weights to next level.
 
-After `jax.vmap` returns, buffer writes are sequential Python mutations: `buffers[k+1].add(x0_rejuv, bridge_lw)`.
+After `jax.vmap` returns, buffer writes are sequential Python mutations: `buffers[k+1].add(x0_rejuv, normalize_log_weights(bridge_lw))`.
 
 **Inner loop** (runs only once all buffers hold ≥ `batch_size` entries)
 
@@ -178,11 +184,24 @@ Run `backward_sde_batch` at `β=1` with `n_sde_steps_eval >> n_sde_steps_train` 
 
 ## Gotchas
 
-**Inner loop is gated on all buffers being ready** — `all_buffers_ready` blocks gradient updates until every buffer (including `buffer[M]`) holds ≥ `batch_size` samples. The first `M-2` outer steps generate data but produce no parameter updates. This is expected behavior, not a bug.
+**Inner loop is gated on all buffers being ready** — `all_buffers_ready` blocks gradient updates until every buffer (including `buffer[M]`) holds ≥ `batch_size` samples. Under the old empty-buffer initialization the first `M-2` outer steps generated data but produced no parameter updates — expected behavior, not a bug. With SMC seeding (`lj13`) every buffer is above `batch_size` before the first outer step, so the gate passes immediately and that warmup dead period disappears. `gmm`/`dw4` are unmigrated and still pay it.
 
 **Buffer writes are sequential, not vmapped** — `buffers[k+1].add(...)` is a Python-level mutation using `jnp.ndarray.at[indices].set(...)`. It happens after `_data_gen_parallel` returns, outside the vmap. Wrapping it inside a vmap will silently discard writes (JAX vmap does not support Python-level side effects).
 
 **Buffer 0 log-weights are `0`, not `-inf`** — `buffer[0]` is seeded with `jnp.zeros(n_particles)` (uniform weights in log-space). Empty buffer slots use `-inf` to be skipped by `systematic_resample`. Confusing these two values will corrupt sampling from buffer 0.
+
+**Log-weight blocks must be normalized before `.add`** — a buffer accumulates blocks written at different times (the SMC seed, then one bridge block per outer step) and `.sample()` resamples across all of them *jointly*, so the blocks' weight scales must be commensurable. Raw bridge weights `Δβ(-E + ½‖x‖²)` run O(10–100) for LJ13 while seed particles carry `0`; mixing them raw lets one block capture the entire buffer regardless of particle count. Normalize every block to mean weight 1 (`lw - logsumexp(lw) + log n`) on the way in. This is a constant shift, so it leaves each block's own ESS unchanged — it only fixes the *relative* weighting between blocks.
+
+**SMC seeding is implemented in all three notebooks** (`lj13`, `dw4`, `gmm`). Per-notebook differences that are deliberate, not drift:
+- `gmm` does no CoM projection (no translation symmetry) and its SMC/calibration/buffer cells run unconditionally rather than behind `_ckpt_data is None` — its `resume` restores only `params`/`opt_state`/`outer_step` and re-runs warmup. That is pre-existing behavior, left as-is.
+- All three seed each buffer with its **whole** SMC block. `n_smc_particles` is a single knob serving three roles — SMC population, per-rung seed size, and buffer capacity — exposed as the derived properties `buffer_capacity` and `n_seed_particles`, which are *not* dataclass fields. They are the same particles at three points in their life, so nothing is subsampled away.
+- `n_mala_seed` is per-notebook (2000 for `lj13`, 200 for `dw4`/`gmm`), scaled to each target's `n_mala_rejuv`.
+
+**The seed drains over `n_smc_particles / n_particles` outer steps** (`seed_flush_steps`, printed at config time). Each buffer starts exactly full, so FIFO overwrites the oldest `K` rows in place each step. Keep that count comfortably below `num_outer_steps` or the run ends while still training partly on SMC particles — which the seed-quality diagnostic shows are far more degenerate than their row count suggests (GMM measured ~101 independent lineages in a 10k block at β=1). This is why `dw4` runs SMC at 50k rather than its former 100k: at `K=10_000` and `num_outer_steps=10`, a 100k population would take the entire run to flush. Raise `num_outer_steps` before raising `n_smc_particles`.
+
+`neal_funnel` and `phi4` are deliberately excluded — they never seed from SMC (buffers 2..M start empty), so their `buffer_capacity` is not coupled to the SMC population and stays an independent field.
+
+Only the algorithm is shared; each notebook keeps its own diagnostics and plots.
 
 **`systematic_resample` requires `n` to be a static Python int** — `@partial(jax.jit, static_argnums=(2,))` is applied. Passing a JAX scalar for `n` causes a tracing error.
 
