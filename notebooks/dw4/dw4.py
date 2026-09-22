@@ -1039,12 +1039,14 @@ def periodic_eval_plot(params, outer_step):
 # %%
 start_outer_step = 0
 loss_history = []
+ess_history: list[list[float]] = []  # one entry per outer step: path ESS per active rung
 
 if _ckpt_data is not None:
     params = _ckpt_data["params"]
     opt_state = _ckpt_data["opt_state"]
     start_outer_step = _ckpt_data["outer_step"]
     loss_history = _ckpt_data.get("loss_history", [])
+    ess_history = _ckpt_data.get("ess_history", [])
     key = jax.random.wrap_key_data(_ckpt_data["key"])
     print(f"Resumed from outer step {start_outer_step}")
 else:
@@ -1095,6 +1097,7 @@ for outer_step in range(start_outer_step, train_cfg.num_outer_steps):
         )
 
         outer_ess_list = path_ess_all.tolist()
+        ess_history.append(outer_ess_list)
 
         for i in range(M_active):
             # Normalize each block on the way in so it is commensurable with
@@ -1167,6 +1170,7 @@ for outer_step in range(start_outer_step, train_cfg.num_outer_steps):
             "opt_state": opt_state,
             "outer_step": outer_step + 1,
             "loss_history": loss_history,
+            "ess_history": ess_history,
             "key": jax.random.key_data(key),
             "betas_list": betas_list,
             "mcmc_params_by_rung": mcmc_params_by_rung,
@@ -1347,3 +1351,95 @@ fig.savefig(FIGURES_DIR / "dw4_temperature_ladder.png", dpi=150)
 plt.close(fig)
 print(f"Temperature ladder figure saved.")
 print(f"Ladder: {[f'{b:.3f}' for b in betas_list]}")
+
+# %% [markdown]
+# ## 17. Post-Training Diagnostics
+#
+# Two additional diagnostics, computed after training has finished.
+
+# %% [markdown]
+# ### 17.1 Path-space ESS per rung, over outer steps
+#
+# `ess_history[step]` is the list of per-rung path-space ESS values
+# (`outer_ess_list`, Section 15) recorded each outer step during the loop —
+# one entry per active rung $k = 1, \ldots, M-1$, in that fixed order. A
+# rung's ESS collapsing over the run (rather than settling) means its
+# backward-SDE proposal is drifting away from $\pi_{\beta_k}$ as the network
+# changes.
+
+# %%
+if ess_history:
+    _ess_arr = np.array(ess_history)          # (n_outer_steps_logged, M_active)
+    _steps = np.arange(1, _ess_arr.shape[0] + 1)
+
+    fig, ax = plt.subplots(figsize=(8, 5))
+    for _i in range(_ess_arr.shape[1]):
+        _rung = _i + 1                          # ess_history columns are rungs 1..M-1, in order
+        ax.plot(_steps, _ess_arr[:, _i], marker="o", markersize=3, linewidth=1.2,
+                label=f"rung {_rung} (β={float(betas[_rung]):.3f})")
+    ax.set_xlabel("outer step", color=C_INK_2, fontsize=10)
+    ax.set_ylabel("normalized path ESS", color=C_INK_2, fontsize=10)
+    ax.set_ylim(0, 1.05)
+    ax.set_title("Path-space ESS per rung over outer steps", color=C_INK, fontsize=11)
+    ax.legend(fontsize=8, ncol=min(_ess_arr.shape[1], 4), frameon=False, labelcolor=C_INK)
+    _style_axis(ax)
+    plt.tight_layout()
+    fig.savefig(FIGURES_DIR / "dw4_path_ess_history.png", dpi=150)
+    plt.close(fig)
+    print(f"Path ESS history figure saved → {FIGURES_DIR / 'dw4_path_ess_history.png'}")
+else:
+    print("No path-ESS history recorded (no active rungs during training) — "
+          "skipping ESS-over-steps diagnostic.")
+
+# %% [markdown]
+# ### 17.2 Merged comparison: all three sample sets vs ground truth
+#
+# Section 16 compares each candidate sample set to the reference in its own
+# column. This overlays all three (`_summary`, computed there) on top of the
+# reference in a single pair of axes — one for pairwise distances, one for
+# energy — each sample set in its own colour, so the three can be read
+# against each other directly rather than only against ground truth.
+
+# %%
+from progressive_is_tempering.utils import honest_density_hist, reference_anchored_window
+
+_MERGED_COLORS = {
+    "SDE raw": "#2a78d6",
+    "SDE + IS": "#2ca02c",
+    "buffer[M]": "#9467bd",
+}
+
+if _summary:
+    fig, (ax_r, ax_e) = plt.subplots(1, 2, figsize=(14, 5.5))
+
+    _all_r = jnp.concatenate([_REF_R] + [_r for _, _, _r, _ in _summary])
+    _all_e = jnp.concatenate([_REF_E] + [_e for _, _e, _, _ in _summary])
+    _r_lo, _r_hi = reference_anchored_window(_all_r, _REF_R)
+    _r_lo = max(_r_lo, 0.0)
+    _e_lo, _e_hi = reference_anchored_window(_all_e, _REF_E)
+
+    honest_density_hist(ax_r, _REF_R, _r_lo, _r_hi, 150, "reference", C_REF, dashed=True)
+    honest_density_hist(ax_e, _REF_E, _e_lo, _e_hi, 150, "reference", C_REF, dashed=True)
+    for _short, _e, _r, _frac in _summary:
+        _color = _MERGED_COLORS.get(_short, C_INK_2)
+        honest_density_hist(ax_r, _r, _r_lo, _r_hi, 150, _short, _color)
+        honest_density_hist(ax_e, _e, _e_lo, _e_hi, 150, _short, _color)
+
+    ax_r.set_xlabel("inter-particle distance $r_{ij}$", color=C_INK_2, fontsize=10)
+    ax_e.set_xlabel("energy $E(x)$", color=C_INK_2, fontsize=10)
+    for _ax, _title in ((ax_r, "Pairwise distances"), (ax_e, "Energy")):
+        _ax.set_ylabel("density", color=C_INK_2, fontsize=10)
+        _ax.set_title(_title, color=C_INK, fontsize=11)
+        _ax.legend(fontsize=9, frameon=False, labelcolor=C_INK)
+        _style_axis(_ax)
+
+    fig.suptitle(
+        f"DW4 — all candidate sample sets vs ground truth, merged (β={float(betas[-1]):.3f})",
+        fontsize=12, color=C_INK,
+    )
+    plt.tight_layout()
+    fig.savefig(FIGURES_DIR / "dw4_merged_comparison.png", dpi=150)
+    plt.close(fig)
+    print(f"Merged comparison figure saved → {FIGURES_DIR / 'dw4_merged_comparison.png'}")
+else:
+    print("No sample sets available — skipping merged comparison diagnostic.")
