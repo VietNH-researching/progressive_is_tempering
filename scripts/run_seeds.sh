@@ -12,7 +12,7 @@
 # whole group is terminated, so no leftover worker (e.g. the Geometric-W2
 # process pool) survives into the next run, and the next run starts only once
 # the group is gone. Before each run the sweep waits until the GPU has no more
-# than MAX_FOREIGN_MB in use, so it does not start into a GPU another job holds.
+# than MAX_FOREIGN_MB in use, so a run never starts on a busy GPU.
 #
 # Usage (from the repo root) — detached, survives closing the editor or
 # disconnecting:
@@ -23,7 +23,7 @@
 # Overrides (environment variables):
 #   TARGETS="gmm dw4 gmm50 lj13"   targets, in run order
 #   SEEDS="0 1 2"                  seeds per target
-#   GPU=1                          physical GPU index (CUDA_VISIBLE_DEVICES)
+#   GPU=0                          physical GPU index (CUDA_VISIBLE_DEVICES)
 #   PYTHON=python                  interpreter with progressive_is_tempering installed
 #   FORCE=1                        re-run seeds already recorded as done
 #   MAX_FOREIGN_MB=2000            wait while the GPU has more than this in use
@@ -34,13 +34,13 @@ set -uo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 TARGETS="${TARGETS:-gmm dw4 gmm50 lj13}"
 SEEDS="${SEEDS:-0 1 2}"
-GPU="${GPU:-1}"
+GPU="${GPU:-0}"
 PYTHON="${PYTHON:-python}"
 FORCE="${FORCE:-0}"
 MAX_FOREIGN_MB="${MAX_FOREIGN_MB:-2000}"
-# lj13's train_step asks for one 15.33 GiB scratch buffer (8 rungs x 512 rows
-# through the 169-edge EGNN backward pass), which does not fit in JAX's default
-# pool of 75% of the card once params, optimiser state and buffers are in it.
+# lj13's training step needs one large (~15 GiB) scratch buffer for the EGNN
+# backward pass over all rungs, which does not fit in JAX's default pool (75%
+# of the device) once parameters, optimiser state and replay buffers are in it.
 MEM_FRACTION="${MEM_FRACTION:-0.95}"
 
 # The sweep's own process group: `kill -TERM -- -<pgid>` stops everything.
@@ -110,12 +110,10 @@ for target in $TARGETS; do
         echo "[$(stamp)] $run: start"
         t0=$SECONDS
         # setsid: the run gets its own process group, reaped as a whole below.
-        # JAX preallocation is forced on. wait_for_gpu already holds each run
-        # until the GPU is nearly empty, and without one contiguous pool the
-        # allocator cannot serve lj13's 15.33 GiB train_step scratch (8 rungs x
-        # 512 rows through the 169-edge EGNN backward pass) — every lj13 seed
-        # died on its first gradient step with RESOURCE_EXHAUSTED. It must be set
-        # explicitly: the notebooks setdefault it to "false" when it is unset.
+        # JAX preallocation is turned on here (see MEM_FRACTION above): without
+        # one contiguous pool, lj13 fails on its first gradient step with
+        # RESOURCE_EXHAUSTED. It must be set explicitly, because the notebooks
+        # default it to "false".
         ( cd "$nb_dir" && exec setsid env \
             CUDA_VISIBLE_DEVICES="$GPU" RUN_SEED="$seed" MPLBACKEND=Agg PYTHONUNBUFFERED=1 \
             XLA_PYTHON_CLIENT_PREALLOCATE=true XLA_PYTHON_CLIENT_MEM_FRACTION="$MEM_FRACTION" \

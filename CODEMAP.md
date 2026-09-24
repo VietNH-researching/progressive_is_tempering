@@ -4,7 +4,7 @@
 
 ```
 progressive_is_tempering/          # repo root
-├── pyproject.toml                 # build config; pins jax_pdf
+├── pyproject.toml                 # build config
 ├── AGENTS.md                      # agent / contributor guidance
 ├── CODEMAP.md                     # this file
 ├── CONTRIBUTING.md                # dev workflow and test guidance
@@ -116,8 +116,10 @@ Unnormalized target distributions. A target exposes `energy(x)`, `log_prob(x)`, 
 |---|---|
 | `GMMTarget` | Factorized GMM over ℝᵈ; each coordinate iid from the same 1-D mixture |
 | `make_gmm_target(dim, means, weights, std)` | Constructs default GMM (d=16, μ=(-1.5, 2.5), w=(0.2, 0.8), σ=0.5) |
+| `DW4(a, b, c, r0, trap_scale, trap_mode, beta)` | Double-well pair potential over 4 particles in 2D; callable, `x: (..., 4, 2)` → unnormalized log-density |
+| `LennardJones(n_particles, spatial_dim, epsilon, rm, trap_scale, trap_mode, beta)` | Lennard-Jones 12-6 cluster with harmonic trap; callable, `x: (..., n, s)` → unnormalized log-density |
 
-The DW4 and LJ13 energies are not here: each of those notebooks wraps the `jax_pdf` energy (`DW4`, `LennardJones`) and defines the zero-CoM reference and projection itself.
+`DW4` and `LennardJones` are bare energies, not `GMMTarget`-style targets: each of those notebooks wraps one into `energy(x)` on flat inputs and defines the zero-CoM reference and projection itself.
 
 ---
 

@@ -34,8 +34,8 @@ pip install matplotlib
 python -c "import progressive_is_tempering"
 ```
 
-**Dependencies installed automatically:** JAX, Flax, Optax, SciPy, POT, and
-[`jax_pdf`](https://github.com/alexxthiery/jax-pdf) (fetched from GitHub by pip; supplies the DW4 and LJ13 energies).
+**Dependencies installed automatically:** JAX, Flax, Optax, SciPy and POT. All
+target energies (GMM, DW4, LJ13) are implemented in `progressive_is_tempering/targets.py`.
 Install the JAX build that matches your accelerator (see the [JAX installation guide](https://docs.jax.dev/en/latest/installation.html)).
 
 ---

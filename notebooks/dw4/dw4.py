@@ -38,13 +38,11 @@ from functools import partial
 from pathlib import Path
 
 import numpy as np
-# Do not preallocate the GPU memory pool. By default JAX claims ~75% of the
-# device's memory when the backend initialises and holds it for the life of the
-# process, which stops anything else sharing the GPU — a second notebook, a
-# queued sweep, another user. Allocating on demand instead can cost a little
-# speed and may fragment under churn, but leaves the device shareable. Must
-# precede `import jax`: the value is read once, at backend init. `setdefault`
-# so the shell can still override it.
+# Allocate GPU memory on demand. By default JAX preallocates ~75% of the
+# device's memory at backend init and holds it for the life of the process;
+# on-demand allocation can cost a little speed but lets other processes use the
+# GPU alongside this one. Must precede `import jax`, since the value is read
+# once at backend init; `setdefault` lets the shell override it.
 os.environ.setdefault("XLA_PYTHON_CLIENT_PREALLOCATE", "false")
 
 import jax
@@ -55,8 +53,6 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
-from jax_pdf import DW4
-
 from progressive_is_tempering.net.egnn_jax import EGNNDynamics
 from progressive_is_tempering.sde import ou_forward_sample
 from progressive_is_tempering.resampling import systematic_resample, normalized_ess
@@ -64,6 +60,7 @@ from progressive_is_tempering.mala_kernel import PTProblem, batch_init_extend, m
 from progressive_is_tempering.smc import smc_sampler
 from progressive_is_tempering.rejuvenate import rejuvenate
 from progressive_is_tempering.buffer import ReplayBuffer
+from progressive_is_tempering.targets import DW4
 from progressive_is_tempering.utils import (
     C_INK,
     C_INK_2,

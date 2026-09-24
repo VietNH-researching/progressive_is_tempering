@@ -33,13 +33,11 @@ from dataclasses import dataclass
 from functools import partial
 from pathlib import Path
 
-# Do not preallocate the GPU memory pool. By default JAX claims ~75% of the
-# device's memory when the backend initialises and holds it for the life of the
-# process, which stops anything else sharing the GPU — a second notebook, a
-# queued sweep, another user. Allocating on demand instead can cost a little
-# speed and may fragment under churn, but leaves the device shareable. Must
-# precede `import jax`: the value is read once, at backend init. `setdefault`
-# so the shell can still override it.
+# Allocate GPU memory on demand. By default JAX preallocates ~75% of the
+# device's memory at backend init and holds it for the life of the process;
+# on-demand allocation can cost a little speed but lets other processes use the
+# GPU alongside this one. Must precede `import jax`, since the value is read
+# once at backend init; `setdefault` lets the shell override it.
 os.environ.setdefault("XLA_PYTHON_CLIENT_PREALLOCATE", "false")
 
 import jax

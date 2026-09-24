@@ -19,10 +19,8 @@ description (temperature ladder construction + data generation + data correction
 
 **External dependencies**:
 
-- `jax_pdf` is installed automatically from GitHub via `pyproject.toml`
-  (`jax_pdf @ git+https://github.com/alexxthiery/jax-pdf.git`). It supplies the
-  DW4 and LJ13 energies, imported by those two notebooks only. Import it as a
-  normal package; do not vendor or modify it.
+- None beyond the PyPI packages in `pyproject.toml`: every target energy
+  (GMM, DW4, Lennard-Jones) is implemented in `targets.py`.
 - The SMC ladder construction and the MALA kernel are implemented in-package
   (`smc.py`, `mala_kernel.py`); there is no other algorithmic dependency.
 - `utils/metrics.py` needs SciPy and POT (both in `pyproject.toml`). The
@@ -60,14 +58,14 @@ no `sys.path` hacks.
 
 ```
 progressive_is_tempering/          # repo root
-├── pyproject.toml                 # build config; pins jax_pdf from GitHub
+├── pyproject.toml                 # build config
 ├── AGENTS.md                      # this file
 ├── docs/
 │   └── TECHNIQUES_SUMMARY.md      # full algorithm math (read this first)
 ├── progressive_is_tempering/      # installable package
 │   ├── __init__.py                # re-exports targets, sde, resampling, sampler, mala, buffer, loss, score_network
 │   ├── sde.py                     # OU forward SDE: transition density + forward sampler
-│   ├── targets.py                 # GMMTarget (DW4 / LJ13 energies come from jax_pdf, in their notebooks)
+│   ├── targets.py                 # GMMTarget + DW4 / LennardJones particle energies
 │   ├── resampling.py              # systematic resampling + normalized ESS
 │   ├── mala.py                    # isotropic MALA step + step-size calibration (not used by the notebooks)
 │   ├── mala_kernel.py             # PTProblem + covariance-preconditioned MALA kernel on the tempered path

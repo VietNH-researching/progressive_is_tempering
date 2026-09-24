@@ -39,13 +39,11 @@ from functools import partial
 from pathlib import Path
 
 import numpy as np
-# Do not preallocate the GPU memory pool. By default JAX claims ~75% of the
-# device's memory when the backend initialises and holds it for the life of the
-# process, which stops anything else sharing the GPU — a second notebook, a
-# queued sweep, another user. Allocating on demand instead can cost a little
-# speed and may fragment under churn, but leaves the device shareable. Must
-# precede `import jax`: the value is read once, at backend init. `setdefault`
-# so the shell can still override it.
+# Allocate GPU memory on demand. By default JAX preallocates ~75% of the
+# device's memory at backend init and holds it for the life of the process;
+# on-demand allocation can cost a little speed but lets other processes use the
+# GPU alongside this one. Must precede `import jax`, since the value is read
+# once at backend init; `setdefault` lets the shell override it.
 os.environ.setdefault("XLA_PYTHON_CLIENT_PREALLOCATE", "false")
 
 import jax
@@ -56,8 +54,6 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
-from jax_pdf import LennardJones
-
 from progressive_is_tempering.net.egnn_jax import EGNNDynamics
 from progressive_is_tempering.sde import ou_forward_sample
 from progressive_is_tempering.resampling import systematic_resample, normalized_ess
@@ -65,6 +61,7 @@ from progressive_is_tempering.mala_kernel import PTProblem, batch_init_extend, m
 from progressive_is_tempering.smc import smc_sampler
 from progressive_is_tempering.rejuvenate import rejuvenate
 from progressive_is_tempering.buffer import ReplayBuffer
+from progressive_is_tempering.targets import LennardJones
 from progressive_is_tempering.utils import (
     C_INK,
     C_INK_2,
@@ -239,11 +236,11 @@ LOG_PATH = RESULTS_DIR / "log.txt"
 lj13 = LennardJones(n_particles=13, spatial_dim=3, epsilon=2.0, rm=1.0,
                      trap_scale=1.0, trap_mode='individual', beta=1.0)
 
-# Local override of LennardJones.__call__'s pairwise-distance floor: jax_pdf
-# hard-codes sqrt(diff**2 + 1e-8), which barely softens the r^-12 term for
-# near-collision pairs (only matters below r ~ sqrt(eps)). We widen the
+# Local override of LennardJones.__call__'s pairwise-distance floor: the
+# package hard-codes sqrt(diff**2 + 1e-8), which barely softens the r^-12 term
+# for near-collision pairs (only matters below r ~ sqrt(eps)). We widen the
 # floor to 1e-5 (r ~ 0.0032) to further dampen this blowup during
-# early/off-equilibrium sampling, without modifying the jax_pdf package.
+# early/off-equilibrium sampling, keeping the shared target unchanged.
 # Params below mirror `lj13` above.
 _R_EPS = 1e-5
 

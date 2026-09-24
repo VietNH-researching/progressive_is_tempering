@@ -18,7 +18,7 @@ These instructions apply inside `notebooks/`.
   different structure.
 - Keep notebook code exploratory. Number the sections to follow the steps in `docs/TECHNIQUES_SUMMARY.md`.
 - Reusable algorithms, networks, and samplers belong in `progressive_is_tempering/` with tests.
-  Target-specific code (an energy wrapped from `jax_pdf`, CoM projection, plots,
+  Target-specific code (the wrapper around a `targets` energy, CoM projection, plots,
   config values) stays in the notebook; see `AGENTS.md` ("Each notebook is self-contained").
 - Estimation, metrics and diagnostics are kept in `progressive_is_tempering/utils/`.
 - Neural network architectures are kept in `progressive_is_tempering/net/`: `ScoreNetwork` (ResMLP) for unstructured targets, `EGNNDynamics` for particle systems.

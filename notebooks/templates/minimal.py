@@ -46,7 +46,7 @@ os.environ.setdefault("XLA_PYTHON_CLIENT_PREALLOCATE", "false")
 # Uncomment to pin a device, and to make the run reproducible: without
 # deterministic ops, GPU floating-point wobble is amplified by SMC's adaptive
 # bisection into a *different temperature ladder* from the same seed.
-# os.environ.setdefault("CUDA_VISIBLE_DEVICES", "1")
+# os.environ.setdefault("CUDA_VISIBLE_DEVICES", "0")
 # os.environ["XLA_FLAGS"] = (os.environ.get("XLA_FLAGS", "")
 #     + " --xla_gpu_deterministic_ops=true --xla_gpu_autotune_level=0").strip()
 
