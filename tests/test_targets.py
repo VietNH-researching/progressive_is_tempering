@@ -5,7 +5,7 @@ Tests cover:
   - GMMTarget log_prob / energy consistency
   - grad_energy correctness (finite-difference check)
   - log_prob sums correctly over dimensions
-  - MPPT interface functions are JAX-traceable
+  - PTProblem interface functions are JAX-traceable
   - make_gmm_target factory defaults
 """
 

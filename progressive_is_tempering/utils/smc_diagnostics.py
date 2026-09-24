@@ -24,13 +24,13 @@ Two failure modes are covered, and they are not the same thing:
 The degeneracy test needs a set of **exchangeable scalar features** — features
 that are statistically identical to one another under the target:
 
-===========  ==========================================================
-Target       Exchangeable features
-===========  ==========================================================
-GMM          the ``d`` coordinates (i.i.d. under a factorised target)
-DW4 / LJ13   the ``C(n,2)`` pairwise distances (particle-permutation
-             symmetry)
-===========  ==========================================================
+===================  ==================================================
+Target               Exchangeable features
+===================  ==================================================
+factorised           the ``d`` coordinates (i.i.d. across coordinates)
+n-particle system    the ``C(n,2)`` pairwise distances (particle-
+                     permutation symmetry)
+===================  ==================================================
 
 Each feature's exceedance probability :math:`p_f = P(\\text{feature}_f > \\tau)`
 must be the same for every ``f``.  Estimated from ``N`` particles, each
@@ -55,6 +55,7 @@ import numpy as np
 __all__ = [
     "C_TEST",
     "C_REF",
+    "REF_FILL_ALPHA",
     "C_INK",
     "C_INK_2",
     "style_axis",
@@ -72,9 +73,11 @@ __all__ = [
 # Colour follows the entity, never the panel: C_TEST is always whatever is being
 # evaluated (the SMC seed, or the model), C_REF is always ground truth — so the
 # eye carries meaning across every figure in every notebook.  The reference is
-# additionally dashed, so identity never rests on colour alone.
-C_TEST = "#2a78d6"   # blue
-C_REF = "#eb6834"    # orange
+# additionally drawn as a filled histogram (the test as a step outline), so
+# identity never rests on colour alone.
+C_TEST = "#eb6834"   # orange
+C_REF = "#2a78d6"    # blue
+REF_FILL_ALPHA = 0.35
 C_INK = "#0b0b0b"    # primary text
 C_INK_2 = "#52514e"  # secondary text
 
@@ -116,8 +119,11 @@ def reference_anchored_window(x_test, x_ref, max_spans: float = 4.0):
     return lo - pad, hi + pad
 
 
-def honest_density_hist(ax, x, lo, hi, bins, label, color, dashed=False) -> float:
+def honest_density_hist(ax, x, lo, hi, bins, label, color, filled=False) -> float:
     """Step histogram whose area equals the IN-WINDOW fraction of the sample.
+
+    ``filled=True`` draws a translucent filled histogram behind the step
+    outlines — the style reserved for the ground-truth reference.
 
     Not ``density=True``.  Matplotlib's density normalizes over the values that
     land inside ``range``, so a sample with 97% of its mass off-window would be
@@ -133,9 +139,12 @@ def honest_density_hist(ax, x, lo, hi, bins, label, color, dashed=False) -> floa
     n_total = max(x.size, 1)
     bin_width = (hi - lo) / bins
     w = np.full(n_total, 1.0 / (n_total * bin_width))
-    ax.hist(x, bins=bins, range=(lo, hi), weights=w, histtype="step",
-            linewidth=1.5, color=color, label=label,
-            linestyle="--" if dashed else "-")
+    if filled:
+        ax.hist(x, bins=bins, range=(lo, hi), weights=w, histtype="stepfilled",
+                color=color, alpha=REF_FILL_ALPHA, label=label, zorder=1)
+    else:
+        ax.hist(x, bins=bins, range=(lo, hi), weights=w, histtype="step",
+                linewidth=1.5, color=color, label=label, zorder=2)
     return float(np.sum((x < lo) | (x > hi))) / n_total
 
 
@@ -145,9 +154,9 @@ def plot_value_comparison(ax, v_test, v_ref, xlabel, label_test="SMC seed",
     lo, hi = reference_anchored_window(v_test, v_ref)
     if clip_at_zero:
         lo = max(lo, 0.0)
-    frac_out = honest_density_hist(ax, v_test, lo, hi, bins, label_test, C_TEST)
     if v_ref is not None:
-        honest_density_hist(ax, v_ref, lo, hi, bins, "reference", C_REF, dashed=True)
+        honest_density_hist(ax, v_ref, lo, hi, bins, "reference", C_REF, filled=True)
+    frac_out = honest_density_hist(ax, v_test, lo, hi, bins, label_test, C_TEST)
     if frac_out > 0.0005:
         ax.text(0.98, 0.94, f"{frac_out:.1%} of {label_test} off-window",
                 transform=ax.transAxes, ha="right", va="top",
@@ -307,12 +316,12 @@ def _plot_occupancy(ax, features_test, features_ref, threshold,
     cnt_test = (ft > threshold).sum(axis=1)
     bins = np.arange(-0.5, n_features + 1.5)
 
-    ax.hist(cnt_test, bins=bins, density=True, histtype="step", linewidth=1.5,
-            color=C_TEST, label=label_test)
     if features_ref is not None:
         cnt_ref = (np.asarray(features_ref) > threshold).sum(axis=1)
-        ax.hist(cnt_ref, bins=bins, density=True, histtype="step", linewidth=1.5,
-                linestyle="--", color=C_REF, label="reference")
+        ax.hist(cnt_ref, bins=bins, density=True, histtype="stepfilled",
+                color=C_REF, alpha=REF_FILL_ALPHA, label="reference", zorder=1)
+    ax.hist(cnt_test, bins=bins, density=True, histtype="step", linewidth=1.5,
+            color=C_TEST, label=label_test, zorder=2)
     ax.set_xlabel(r"# features above $\tau$ (per particle)",
                   color=C_INK_2, fontsize=10)
     ax.set_ylabel("probability", color=C_INK_2, fontsize=10)

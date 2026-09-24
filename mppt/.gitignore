@@ -1,7 +1,0 @@
-.claude/
-.codex/
-.agents/
-__pycache__/
-notebooks-debug/
-/data/*
-!/data/redownload.sh

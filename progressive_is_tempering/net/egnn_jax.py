@@ -1,8 +1,9 @@
-"""JAX/Flax implementation of EGNN_dynamics for particle systems.
+"""E(n)-equivariant graph neural network for particle systems.
 
-Equivalent to EGNN_dynamics in model.py (PyTorch), adapted for JAX/Flax.
-Uses dense all-pairs computation (no explicit scatter/gather) since the
-graph is fully connected and fixed for DW4 (4 particles, 2D).
+Score-network backbone for targets made of N interacting particles in D
+spatial dimensions (flat state x in R^{N*D}). Uses dense all-pairs
+computation (no explicit scatter/gather) since the graph is fully connected
+and fixed.
 
 Reference:
     Satorras, Hoogeboom, Welling (2021). E(n) Equivariant Graph Neural Networks.
@@ -82,8 +83,7 @@ class EGNNLayer(nn.Module):
             coord:     Particle positions,              shape (B, N, D).
             edge_attr: Initial squared pairwise dists,  shape (B, N, N, 1).
                        Computed once from the input coordinates in EGNNDynamics
-                       and passed unchanged to every layer, matching the
-                       EGNN_dynamics behaviour in model.py.
+                       and passed unchanged to every layer.
 
         Returns:
             h_new:     Updated node features,  shape (B, N, hidden_nf).
@@ -101,8 +101,8 @@ class EGNNLayer(nn.Module):
         # ---- Edge messages phi_e ----------------------------------------------
         h_i = jnp.broadcast_to(h[:, :, None, :], (B, N, N, self.hidden_nf))
         h_j = jnp.broadcast_to(h[:, None, :, :], (B, N, N, self.hidden_nf))
-        # Concatenate current radial AND fixed initial edge_attr, matching
-        # E_GCL.edge_model in model.py: cat([source, target, radial, edge_attr])
+        # Concatenate current radial AND fixed initial edge_attr:
+        # cat([source, target, radial, edge_attr])
         edge_input = jnp.concatenate([h_i, h_j, radial, edge_attr], axis=-1)  # (B, N, N, 2*hid+2)
 
         m = nn.Dense(self.hidden_nf)(edge_input)
@@ -145,18 +145,14 @@ class EGNNLayer(nn.Module):
 class EGNNDynamics(nn.Module):
     """E(n)-equivariant GNN dynamics network for particle systems.
 
-    JAX/Flax equivalent of EGNN_dynamics in model.py (PyTorch). Designed
-    for the DW4 target: 4 particles in 2D, total state x in R^8.
+    The network takes flat particle coordinates x, time t and (optionally)
+    the inverse temperature beta, and returns a learned displacement vector
+    of the same shape, projected to zero centre of mass. This output is used
+    directly as the beta-conditioned excess score
 
-    The network takes flat particle coordinates x and time t and returns
-    a learned displacement vector of the same shape. This displacement is
-    the raw network output s_hat_theta(x, t) that enters the iDEM
-    reparametrised score:
+        s_theta(x_t, t, beta) ~ grad_x log(p_t^beta / p_t^rho),
 
-        s_theta(x, t) = lam_t * [(-grad E(x) + x) + (1 - lam_t) * s_hat_theta(x, t)]
-
-    where lam_t = exp(-t). The boundary wrapping is done in make_score_fn,
-    not here.
+    with no further wrapping.
 
     Equivariance properties
     -----------------------
@@ -169,7 +165,7 @@ class EGNNDynamics(nn.Module):
     Time conditioning
     -----------------
     Time t is broadcast as a constant scalar feature across all N nodes
-    before the input embedding (matches EGNN_dynamics when condition_time=True).
+    before the input embedding (when condition_time=True).
 
     Attributes:
         n_particles:    Number of particles N. Default: 4.
@@ -181,7 +177,7 @@ class EGNNDynamics(nn.Module):
         tanh:           Tanh on coordinate update weights. Default: True.
         condition_time: Use t as initial node feature. Default: True.
         coords_range:   Total coord-update scale, split evenly across layers.
-                        Default: 15.0 (matches PyTorch config).
+                        Default: 15.0.
     """
 
     n_particles: int = 4
@@ -216,11 +212,9 @@ class EGNNDynamics(nn.Module):
         coord = x.reshape(B, N, D)   # (B, N, D)
         coord_in = coord             # keep for velocity computation
 
-        # Compute edge_attr once from the INITIAL coordinates.
-        # This mirrors EGNN_dynamics.forward in model.py, which precomputes
-        #   edge_attr = sum((x[i] - x[j])^2)
-        # before the layer loop and passes it unchanged to every E_GCL layer.
-        # From layer 1 onwards, coord changes but edge_attr stays fixed, so
+        # Compute edge_attr = sum((x[i] - x[j])^2) once from the INITIAL
+        # coordinates, before the layer loop, and pass it unchanged to every
+        # layer. From layer 1 onwards, coord changes but edge_attr stays fixed, so
         # it carries different information from the per-layer radial.
         coord_diff_init = coord_in[:, :, None, :] - coord_in[:, None, :, :]  # (B, N, N, D)
         edge_attr = jnp.sum(coord_diff_init ** 2, axis=-1, keepdims=True)    # (B, N, N, 1)

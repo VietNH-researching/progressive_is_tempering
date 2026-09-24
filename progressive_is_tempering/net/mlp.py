@@ -1,5 +1,5 @@
 """
-Neural network architectures for iDEM.
+MLP backbones for the score network.
 
 This module provides MLP architectures designed for score function approximation
 in diffusion-based sampling methods.
@@ -17,7 +17,7 @@ MLP
 
 Notes
 -----
-For score networks in iDEM, use ResMLP which has built-in small output
+For score networks, use ResMLP which has built-in small output
 initialization for training stability.
 """
 

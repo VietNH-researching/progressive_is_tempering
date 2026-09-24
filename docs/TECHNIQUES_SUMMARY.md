@@ -1,7 +1,9 @@
-# Sequential Score Matching via SMC Temperature Bridging
+# Sequential Score Sampler (SSS)
 
-This documentation describes a sequential training algorithm for a score-based
-diffusion sampler targeting an unnormalized density with a tractable energy. The
+This document describes the Sequential Score Sampler (SSS), the method of the
+paper *Amortizing Tempered Sampling with Corrected Self-Training*: a sequential
+training algorithm for a score-based diffusion sampler targeting an
+unnormalized density with a tractable energy. The
 main idea is to let an SMC sweep lay out a temperature ladder from an easy
 Gaussian reference to the target, then train a single $\beta$-conditioned score
 network on data the network itself generates — with a path-space importance
@@ -10,7 +12,7 @@ training set, so that imperfect scores still produce usable data.
 
 ---
 
-## Introduction:
+## Introduction
 
 Our goal is to sample from
 
@@ -75,7 +77,7 @@ the sampler is that SDE plus an importance correction.
 
 ---
 
-## Main Algorithm:
+## Main Algorithm
 
 The algorithm has three phases:
 
@@ -319,6 +321,18 @@ genuine score error rather than discretization bias inherited from the
 integrator. Euler–Maruyama loses this property, because its kernel does not leave
 $\rho$ invariant (see *Relation to Euler–Maruyama* above).
 
+### Particle systems with translation symmetry
+
+For $n$-particle systems (DW4, LJ13) the energy is invariant under a common
+translation, so the whole machinery runs on the zero-centre-of-mass subspace.
+The prior draw $x_T$, every forward-noised sample $x_t$ and every backward step
+$x_{n-1}$ are projected to zero CoM, and the step-wise densities $p_\rho$ and
+$q_\theta$ above are evaluated at the projected states. The score network is an
+EGNN whose output is itself zero-CoM. The same constraint applies to the MCMC
+kernel, which is not aware of it: the SMC particle stack is projected once
+before use (Phase 1), and rejuvenation re-projects after every move (Phase 2,
+Step 1c).
+
 ---
 
 ## Phase 1: Initialization
@@ -327,8 +341,8 @@ Everything in this phase runs **once**, before the first gradient step.
 
 ### Step 1: Discover the temperature ladder by SMC
 
-The problem is handed to `mppt.smc_sampler` as a `PTProblem` — the triple
-(`rvs_ref`, `logpdf_ref`, `logpdf_final_target`) — from which mppt builds the
+The problem is handed to `smc.smc_sampler` as a `PTProblem` — the triple
+(`rvs_ref`, `logpdf_ref`, `logpdf_final_target`) — from which it builds the
 same geometric path defined above.
 
 SMC sweeps $\beta=0\to1$ and grows the ladder greedily. From the current rung
@@ -352,26 +366,22 @@ selection already encodes that information.
 
 ### Step 2: Harvest what SMC already computed
 
-Two flags turn the sweep into a source of reusable state.
+Besides the ladder, `smc_sampler` returns two pieces of reusable state.
 
-`keep_all_states=True` returns the particle positions at every rung, stacked as
-`(M+1, N_smc, d)` and indexed to match $\{\beta_k\}$. These are the only samples
-available before training that are actually distributed as $\pi_{\beta_k}$.
+The particle positions at every rung, stacked as `(M+1, N_smc, d)` and indexed to
+match $\{\beta_k\}$. These are the only samples available before training that
+are actually distributed as $\pi_{\beta_k}$.
 
-`keep_mcmc_params=True` returns the MCMC kernel SMC adapted *at* each rung. In
-MALA mode the kernel is a single-leapfrog-step HMC with full velocity refresh —
-i.e. preconditioned MALA — whose preconditioner is the Cholesky factor of the
-empirical covariance of that rung's population and whose step size $\varepsilon$
-is adapted to land the acceptance rate in $[0.4,0.65]$.
+The MCMC kernel parameters SMC adapted *at* each rung. The kernel is a
+single-leapfrog-step HMC with full velocity refresh — i.e. preconditioned MALA —
+whose preconditioner is the Cholesky factor of the empirical covariance of that
+rung's population and whose step size $\varepsilon$ is bisected to land the
+acceptance rate in $[0.4,0.65]$.
 
-This kernel is reused verbatim for outer-loop rejuvenation in Phase 2. Nothing
-is recalibrated afterwards, and that is deliberate: an earlier revision tuned a
-separate isotropic MALA step size $h_k$ per level by bisection on particles
-IS-resampled in one shot from $\beta_0$ straight to $\beta_k$. That single bridge
-skips the whole ladder, so its ESS collapses and the "calibration set" degenerates
-to a handful of configurations — $h_k$ then reflects the curvature at an atypical
-point rather than at $\pi_{\beta_k}$. SMC's own per-rung adaptation has neither
-problem, and it is free.
+This kernel is reused verbatim for outer-loop rejuvenation in Phase 2, and
+nothing is recalibrated afterwards: it was adapted on a population actually
+distributed as $\pi_{\beta_k}$, so its preconditioner and step size already
+match the rung, and it comes at no extra cost.
 
 ### Step 3: Check the seed before spending a training run
 
@@ -411,9 +421,8 @@ $$
 
 A ground-truth set is pushed through the identical computation as a control:
 being i.i.d., it should recover its own size, and when it does not, the features
-are not exchangeable for this target and the test is uninformative. In practice
-the gap is stark — a $10^4$-particle block at $\beta=1$ has been measured to
-carry on the order of $10^2$ independent lineages.
+are not exchangeable for this target and the test is uninformative. The implied
+count of an SMC block can be orders of magnitude below its row count.
 
 ### Step 4: Seed the replay buffers
 
@@ -566,11 +575,12 @@ Degenerate blocks (all weights $-\infty$) fall back to uniform.
 ### Step 2: Inner loop — joint gradient descent
 
 Once every buffer holds at least $B$ samples, run `n_inner_steps` Adam updates on
-the joint denoising objective.
+the joint **Target Score Matching (TSM)** objective.
 
-**The regression target.** By the Tweedie identity for the OU process, the excess
-score of the noised marginal is a conditional expectation of the excess score of
-the *clean* one,
+**The regression target.** By the target score identity for the OU process —
+which holds for the excess score because $\rho$ is stationary under the OU
+dynamics — the excess score of the noised marginal is a conditional expectation
+of the excess score of the *clean* one,
 
 $$
 \nabla_{x_t}\log\frac{p_t^\beta(x_t)}{p_t^\rho(x_t)}
@@ -593,8 +603,10 @@ $$
 \lambda_t\,\beta\,\bigl(x_0-\nabla E(x_0)\bigr),
 $$
 
-and DDPM-style training replaces the conditional expectation over $x_0\mid x_t$
-with the single draw $x_0$ that generated $x_t$. The objective is
+and TSM training replaces the conditional expectation over $x_0\mid x_t$ with the
+single draw $x_0$ that generated $x_t$. The TSM target is built from the
+target's own score at the clean sample, which is available because $E$ is
+tractable. The objective is
 
 $$
 \mathcal{L}(\theta)
@@ -616,7 +628,7 @@ Three properties are worth naming:
 - At $\beta=1$ the target is $\lambda_t(x_0-\nabla E(x_0))$, the full correction
   from reference to target.
 - The target needs $\nabla E$ only at **clean** samples, and does not depend on
-  $x_t$ at all. It is computed once per buffer sample and reused.
+  $x_t$ at all (the implementation still recomputes it for every mini-batch).
 
 **One inner step.** For each temperature $\beta_k$, $k=0,\ldots,M$:
 
@@ -700,12 +712,13 @@ m=1,\ldots,n,
 $$
 
 and map each through the weight CDF to a particle index. The single shared
-variate is the point: it gives $O(1)$ variance in the index counts against
-$O(N)$ for multinomial resampling, at the same cost.
+variate is the point: particle $i$ is copied either $\lfloor nw_i\rfloor$ or
+$\lceil nw_i\rceil$ times, whereas multinomial resampling copies it a
+$\mathrm{Binomial}(n,w_i)$ number of times, at the same cost.
 
 ---
 
-## Diagnostics:
+## Diagnostics
 
 The quantities worth watching, in the order they fail:
 
@@ -727,7 +740,7 @@ The quantities worth watching, in the order they fail:
 
 ---
 
-## Overall Summary:
+## Overall Summary
 
 ```text
 Initialization (once):
@@ -751,8 +764,8 @@ Training (num_outer_steps iterations):
     -- inner loop: n_inner_steps Adam updates --
         for each k: draw B particles from buffer[k] by systematic resampling
         noise each to x_t via the OU kernel at t ~ Unif[t_min, T]
-        target: lambda_t * beta_k * (x_0 - grad E(x_0))     [stop_gradient]
-        one Adam step on the joint MSE over all (M+1)*B samples
+        TSM target: lambda_t * beta_k * (x_0 - grad E(x_0)) [stop_gradient]
+        one Adam step on the joint TSM loss over all (M+1)*B samples
 
 Production:
     x_T ~ N(0, I)

@@ -1,0 +1,71 @@
+{
+  "schema_version": 1,
+  "method": "progressive_is_tempering",
+  "target": "lj13",
+  "run_id": "buffer",
+  "seed": 0,
+  "metrics": {
+    "w2_pooled": 0.013139917478181985,
+    "w2_energy": 0.6467607796963207,
+    "geometric_w2": 1.4723720818443784,
+    "energy_mean": -42.523956298828125,
+    "energy_mean_ref": -43.12718963623047,
+    "n_eval_samples": 10000,
+    "n_ref_samples": 10000,
+    "ess": null,
+    "path_ess": 0.00010281876166118309,
+    "buffer_ess": 0.4803939759731293
+  },
+  "config": {
+    "model": {
+      "n_particles": 13,
+      "spatial_dim": 3,
+      "x_dim": 39,
+      "hidden_nf": 128,
+      "n_layers": 5,
+      "recurrent": true,
+      "attention": true,
+      "tanh": true,
+      "condition_time": true,
+      "condition_beta": true,
+      "beta_embedding_dim": 8,
+      "coords_range": 15.0
+    },
+    "training": {
+      "T": 4.0,
+      "t_min": 0.01,
+      "n_sde_steps_train": 25,
+      "n_sde_steps_eval": 1000,
+      "num_outer_steps": 50,
+      "n_particles": 5000,
+      "n_inner_steps": 1000,
+      "batch_size": 512,
+      "n_mala_rejuv": 2000,
+      "score_clip": 10000.0,
+      "target_clip_norm": 150.0,
+      "learning_rate": 0.001,
+      "grad_clip": 1.0,
+      "n_smc_particles": 25000,
+      "smc_local_ess_ratio": 0.2,
+      "smc_n_mcmc_steps": 200,
+      "log_every": 1,
+      "save_every": 1,
+      "eval_every": null,
+      "n_eval_particles": 20000,
+      "n_eval_samples": 10000
+    },
+    "betas": [
+      0.0,
+      0.001953125,
+      0.1033172607421875,
+      0.299466609954834,
+      0.4855457842350006,
+      0.6623893976211548,
+      0.854932963848114,
+      1.0
+    ]
+  },
+  "commit": null,
+  "timestamp": "2026-09-23T17:32:38Z",
+  "notes": "Sample set: buffer[M]  \u03b2=1.000 (buffer ESS=0.480)."
+}

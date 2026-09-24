@@ -14,7 +14,7 @@
 # ---
 
 # %% [markdown]
-# # Sequential Score Matching via SMC Temperature Bridging — DW4
+# # Sequential Score Sampler (SSS) — DW4
 #
 # Trains a $\beta$-conditioned EGNN score network on the double-well 4-particle
 # system (DW4, 8-dimensional, translation-invariant) using an SMC-discovered
@@ -30,6 +30,7 @@
 # %%
 from __future__ import annotations
 
+import os
 import time
 import pickle
 from dataclasses import dataclass
@@ -37,6 +38,15 @@ from functools import partial
 from pathlib import Path
 
 import numpy as np
+# Do not preallocate the GPU memory pool. By default JAX claims ~75% of the
+# device's memory when the backend initialises and holds it for the life of the
+# process, which stops anything else sharing the GPU — a second notebook, a
+# queued sweep, another user. Allocating on demand instead can cost a little
+# speed and may fragment under churn, but leaves the device shareable. Must
+# precede `import jax`: the value is read once, at backend init. `setdefault`
+# so the shell can still override it.
+os.environ.setdefault("XLA_PYTHON_CLIENT_PREALLOCATE", "false")
+
 import jax
 import jax.numpy as jnp
 from jax.scipy.special import logsumexp
@@ -50,7 +60,9 @@ from jax_pdf import DW4
 from progressive_is_tempering.net.egnn_jax import EGNNDynamics
 from progressive_is_tempering.sde import ou_forward_sample
 from progressive_is_tempering.resampling import systematic_resample, normalized_ess
-from progressive_is_tempering.mppt_rejuvenate import mppt_rejuvenate
+from progressive_is_tempering.mala_kernel import PTProblem, batch_init_extend, mala_kernel
+from progressive_is_tempering.smc import smc_sampler
+from progressive_is_tempering.rejuvenate import rejuvenate
 from progressive_is_tempering.buffer import ReplayBuffer
 from progressive_is_tempering.utils import (
     C_INK,
@@ -62,8 +74,15 @@ from progressive_is_tempering.utils import (
     smc_seed_quality_figure,
     style_axis,
 )
+from progressive_is_tempering.utils.metrics import distance_w2, energy_w2, geometric_w2
+from progressive_is_tempering.utils.report import write_record
 
 SEED = 0
+# Seed sweeps: `RUN_SEED=N` runs seed N and writes under results/<target>/seedN/.
+# Unset, the run uses SEED above and writes under results/<target>/.
+if "RUN_SEED" in os.environ:
+    SEED = int(os.environ["RUN_SEED"])
+SEED_DIR = f"seed{SEED}" if "RUN_SEED" in os.environ else None
 key = jax.random.key(SEED)
 
 print(f"JAX devices: {jax.devices()}")
@@ -101,14 +120,14 @@ class TrainingConfig:
 
     # Outer loop
     num_outer_steps: int = 10
-    n_particles: int = 10_000     # K: particles per backward SDE run
+    n_particles: int = 30_000     # K: particles per backward SDE run
 
     # Inner loop
-    n_inner_steps: int = 500
+    n_inner_steps: int = 1_000
     batch_size: int = 512        # B per temperature
 
-    # MALA rejuvenation (mppt's own SMC-tuned kernel; see mppt_rejuvenate)
-    n_mala_rejuv: int = 200       # MALA steps per particle per outer step
+    # MALA rejuvenation (the SMC-tuned kernel; see rejuvenate)
+    n_mala_rejuv: int = 10        # MALA steps per particle per outer step
 
     # Clipping (empirically tuned for DW4's EGNN score network)
     score_clip: float = 1e4
@@ -118,7 +137,7 @@ class TrainingConfig:
     learning_rate: float = 1e-3
     grad_clip: float = 1.0
 
-    # MPPT SMC (temperature ladder)
+    # SMC (temperature ladder)
     #
     # One number governs the SMC population, the per-rung seed, and the buffer
     # capacity: they are the same particles at three points in their life. SMC
@@ -126,19 +145,25 @@ class TrainingConfig:
     # that rung's buffer, and the outer loop evicts them gradually (FIFO) as
     # backward-SDE data arrives.
     #
-    # The seed drains in n_smc_particles / n_particles = 5 outer steps, half of
-    # num_outer_steps — comfortably inside the run so the network spends the
-    # second half training on its own generated data. Raising n_smc_particles
+    # The seed drains in n_smc_particles / n_particles ≈ 2.7 outer steps, about a quarter
+    # of num_outer_steps — comfortably inside the run, so the network spends
+    # most of the run training on its own generated data. Raising n_smc_particles
     # pushes that fraction up; raise num_outer_steps to match.
-    n_smc_particles: int = 50_000
-    mppt_local_ess_ratio: float = 0.2
-    mppt_n_mcmc_steps: int = 10
+    n_smc_particles: int = 81_920
+    smc_local_ess_ratio: float = 0.2
+    smc_n_mcmc_steps: int = 10
 
     # Checkpointing / logging
     log_every: int = 1
     save_every: int = 1
-    eval_every: int = 1
+    # Outer steps between periodic evaluation plots; None disables them (e.g.
+    # for seed sweeps). Each periodic evaluation draws from the training key,
+    # so a run with None does not reproduce one with plots draw-for-draw.
+    eval_every: int | None = None
     n_eval_particles: int = 10_000
+    # Particles in the final evaluation draw, scored by the reported metrics;
+    # n_eval_particles above sizes only the periodic plots.
+    n_eval_samples: int = 10_000
 
     # --- Derived: seed size and buffer capacity are the SMC population -------
     @property
@@ -175,15 +200,19 @@ if _flush >= train_cfg.num_outer_steps:
 resume: bool = False
 
 NOTEBOOK_NAME = "dw4"
-CHECKPOINT_DIR = Path("../../checkpoints") / NOTEBOOK_NAME
-LOG_DIR = Path("../../logging")
-FIGURES_DIR = Path("../../figures") / NOTEBOOK_NAME
+# Everything a run writes lives in results/<target>/ (results/<target>/seedN/
+# for a seed sweep): checkpoint.pkl, log.txt and figures/ (gitignored) and one
+# <run_id>/metrics.json per evaluated sample set (tracked).
+RESULTS_DIR = Path("../../results") / NOTEBOOK_NAME
+if SEED_DIR is not None:
+    RESULTS_DIR = RESULTS_DIR / SEED_DIR
+FIGURES_DIR = RESULTS_DIR / "figures"
 EVAL_FIGURES_DIR = FIGURES_DIR / "eval"
-for d in [CHECKPOINT_DIR, LOG_DIR, FIGURES_DIR, EVAL_FIGURES_DIR]:
+for d in [RESULTS_DIR, FIGURES_DIR, EVAL_FIGURES_DIR]:
     d.mkdir(parents=True, exist_ok=True)
 
-CHECKPOINT_PATH = CHECKPOINT_DIR / "checkpoint.pkl"
-LOG_PATH = LOG_DIR / f"{NOTEBOOK_NAME}.txt"
+CHECKPOINT_PATH = RESULTS_DIR / "checkpoint.pkl"
+LOG_PATH = RESULTS_DIR / "log.txt"
 
 # %% [markdown]
 # ## 1. Target Distribution (DW4)
@@ -220,7 +249,7 @@ print(f"∇E norm at 0 = {jnp.linalg.norm(jax.grad(energy)(x_test)):.4f}")
 # summary statistics every comparison in this notebook uses — **pairwise
 # distances** (cluster geometry) and **energy** (how physically plausible a
 # configuration is). They live here, ahead of SMC, because three separate
-# places compare against them: the SMC seed diagnostic (Section 9), the
+# places compare against them: the SMC seed diagnostic (Section 10), the
 # periodic eval during training (Section 14), and the final eval (Section 16).
 # One definition, one styling, so the three are directly comparable.
 
@@ -264,22 +293,25 @@ def get_energies(x_flat: jnp.ndarray) -> jnp.ndarray:
 
 
 # ---- Reference (ground-truth) samples ---------------------------------------
-# Pre-computed MPPT particles at β=1. Both summary statistics are translation
-# invariant, so no CoM projection is needed to compare against them.
-_ref_npz = np.load(Path("../../data/dw4_samples.npz"))
-_pt_ref = jnp.array(_ref_npz["particles"]).reshape(-1, model_cfg.x_dim)  # (100000, 8)
+# Standard DW4 test split, data/test_split_DW4.npy (data/redownload.sh
+# re-fetches it). The raw samples are not CoM-centred; project
+# them onto the zero-CoM subspace the rest of the notebook works in. Both
+# summary statistics are translation invariant, so this changes neither.
+_pt_ref = project_com(
+    jnp.array(np.load(Path("../../data/test_split_DW4.npy"))).reshape(-1, model_cfg.x_dim)
+)  # (10000, 8)
 print(f"Loaded reference samples: {_pt_ref.shape}")
 
-_REF_R = get_pairwise_distances(_pt_ref)      # (100000, 6)
-_REF_E = get_energies(_pt_ref)                 # (100000,)
+_REF_R = get_pairwise_distances(_pt_ref)      # (10000, 6)
+_REF_E = get_energies(_pt_ref)                 # (10000,)
 print(f"Reference energy: mean={float(_REF_E.mean()):.2f}  "
       f"[min={float(_REF_E.min()):.2f}, max={float(_REF_E.max()):.2f}]")
 
 # ---- Comparison plot helpers ------------------------------------------------
 # From `progressive_is_tempering/utils/smc_diagnostics.py`. Colour follows the
 # entity, never the panel — C_TEST is always whatever is under evaluation,
-# C_REF is always ground truth — and the reference is additionally dashed, so
-# identity never rests on colour alone.
+# C_REF is always ground truth — and the reference is additionally a filled
+# histogram, so identity never rests on colour alone.
 _style_axis = style_axis   # local alias: this notebook styles its own axes too
 
 
@@ -303,7 +335,7 @@ def plot_energy_comparison(ax, e_test, label_test, e_ref=_REF_E, bins=150):
     )
 
 # %% [markdown]
-# ## 3. MPPT Interface for DW4
+# ## 3. Tempering Problem for DW4
 #
 # The geometric path bridges
 # $\rho(x) = \mathcal{N}(x;0,I)$ (restricted to CoM=0)
@@ -327,15 +359,9 @@ def rvs_ref(key: jnp.ndarray) -> jnp.ndarray:
 
 
 # %%
-# mppt_problem is built here (rather than at the SMC call in Section 9) so
-# Section 7's MALA demo can also use it, and mppt's kernel-construction
-# helpers (needed there too) are imported once, in one place.
-import sys
-sys.path.insert(0, str(Path("../../mppt").resolve()))
-
-from mppt import PTProblem, smc_sampler
-
-mppt_problem = PTProblem(
+# pt_problem is built here (rather than at the SMC call in Section 9) so
+# Section 7's MALA demo can also use it.
+pt_problem = PTProblem(
     rvs_ref=rvs_ref,
     logpdf_ref=logpdf_ref,
     logpdf_final_target=logpdf_final_target,
@@ -402,8 +428,8 @@ print(f"n_particles={model_cfg.n_particles}, spatial_dim={model_cfg.spatial_dim}
 # $p_\rho(x_n \mid x_{n-1})$ and the backward proposal
 # $q_\theta(x_{n-1} \mid x_n)$ are evaluated at the projected state.
 #
-# The control function wraps the EGNN (batched interface) with a batch
-# dimension of 1 for single-particle calls inside vmap.
+# All particles advance together: the EGNN (batched interface) is called once
+# per time step on the whole `(K, 8)` batch.
 
 # %%
 def backward_sde_batch_com(
@@ -496,33 +522,29 @@ print(f"  Max |CoM| in samples: {jnp.abs(_com_demo).max():.2e}  (should be ≈ 0
 # %% [markdown]
 # ## 7. CoM-Projected MALA Rejuvenation
 #
-# Rejuvenation uses mppt's own MALA-mode HMC kernel (`mppt_rejuvenate`, from
-# `progressive_is_tempering/mppt_rejuvenate.py`) — the *same* kernel SMC
-# (Section 9) tunes per rung via `keep_mcmc_params=True` — rather than a
-# separately-calibrated implementation. mppt's kernel has no CoM-awareness at
-# all, so `mppt_rejuvenate`'s `project_fn` hook re-projects to zero-CoM after
-# *every* internal move, never leaving the constraint manifold.
+# Rejuvenation uses the covariance-preconditioned MALA kernel (`rejuvenate`,
+# from `progressive_is_tempering/rejuvenate.py`) with the parameters SMC
+# (Section 9) tunes per rung. The kernel has no CoM-awareness at all, so
+# `rejuvenate`'s `project_fn` hook re-projects to zero-CoM after *every*
+# internal move, never leaving the constraint manifold.
 #
-# This demo runs before SMC has produced a real ladder, so it calibrates a
-# throwaway kernel directly via mppt's own `adapt_params` (not a bisection
-# reimplementation) at an illustrative rung — this is *not* the calibration
-# used for training; that comes from SMC itself in Section 9.
+# This demo runs before SMC has produced a real ladder, so it adapts a
+# throwaway kernel with the kernel's own `adapt_params` at an illustrative
+# rung. Training does not use it: training uses the kernels SMC adapts in
+# Section 9.
 
 # %%
-from mppt.abstract.mcmc import batch_init_extend as _batch_init_extend_demo
-from mppt.impl.pt_mcmc_hmc import hmc_pt_mcmc as _hmc_pt_mcmc_demo
-
 _demo_beta, _demo_t_idx = jnp.array(0.1), 1
-_demo_mcmc = _hmc_pt_mcmc_demo(mppt_problem, _demo_beta, _demo_t_idx, mala=True)
+_demo_mcmc = mala_kernel(pt_problem, _demo_beta, _demo_t_idx)
 
 key, subkey = jax.random.split(key)
 _pts = jax.vmap(project_com)(jax.random.normal(subkey, (20, model_cfg.x_dim)))
 key, k_init, k_adapt, k_move = jax.random.split(key, 4)
-_demo_x = _batch_init_extend_demo(k_init, _pts, _demo_mcmc)
+_demo_x = batch_init_extend(k_init, _pts, _demo_mcmc)
 _demo_params = _demo_mcmc.adapt_params(k_adapt, _demo_x)
 
-_pts_mala, _mala_acc = mppt_rejuvenate(
-    k_move, _pts, mppt_problem, _demo_beta, _demo_t_idx, _demo_params, 5,
+_pts_mala, _mala_acc = rejuvenate(
+    k_move, _pts, pt_problem, _demo_beta, _demo_t_idx, _demo_params, 5,
     project_fn=project_com,
 )
 print(f"MALA demo (β={float(_demo_beta):.3f}, rung 1, 5 steps): "
@@ -572,33 +594,29 @@ def normalize_log_weights(log_w: jnp.ndarray) -> jnp.ndarray:
 
 
 # %% [markdown]
-# ## 9. Temperature Ladder via SMC (MPPT)
+# ## 9. Temperature Ladder via SMC
 #
 # Run SMC once before training to discover $\{\beta_k\}_{k=0}^M$ such that
 # successive IS bridges have normalized ESS $\geq$ `local_ess_ratio`.
 #
-# `keep_all_states=True` returns the particle positions at **every** rung,
+# `smc_sampler` returns the particle positions at **every** rung,
 # stacked as `(len(betas_list), n_smc_particles, 8)` and indexed in the same
 # order as `betas_list`. These are the only samples available before training
 # that are actually distributed according to $\pi_{\beta_k}$ at each level,
 # and are used to seed the replay buffers (Section 11).
 #
-# `keep_mcmc_params=True` additionally returns the per-rung MALA kernel
+# It additionally returns the per-rung MALA kernel
 # (covariance + step size) SMC itself adapted while building the ladder. That
-# *same* kernel — not a separately recalibrated one — is reused for
-# outer-loop rejuvenation (Section 12); see `mppt_rejuvenate`. The buffer
-# seed (Section 11) uses SMC's particle output directly, with no further
-# MALA pass. This is why the SMC engine below is `"mala"` (not the
-# previous `"hmc"`): the captured kernel must be calibrated for the same
-# MALA acceptance regime `mppt_rejuvenate` uses.
-#
-# Particle diversification happens explicitly via MALA in the outer loop
-# (Section 12) — no separate parallel-tempering step is run here.
+# kernel is reused as-is for outer-loop rejuvenation (Section 12); see
+# `rejuvenate`. The buffer seed (Section 11) uses SMC's particle output
+# directly, with no further MALA pass. SMC moves with the same MALA kernel
+# `rejuvenate` uses, so the captured kernel is calibrated for exactly that
+# acceptance regime.
 
 # %%
-# mppt_problem and the sys.path/import setup were done in Section 3.
+# pt_problem was built in Section 3.
 
-# Early-load checkpoint before SMC/PT/calibration so we can skip them on resume
+# Early-load the checkpoint before SMC, so that SMC can be skipped on resume
 _ckpt_data = None
 if resume and CHECKPOINT_PATH.exists():
     with open(CHECKPOINT_PATH, "rb") as f:
@@ -612,22 +630,18 @@ if _ckpt_data is None:
     t0 = time.time()
     smc_particles, logZ_dict, betas_list, mcmc_params_by_rung = smc_sampler(
         subkey,
-        mppt_problem,
+        pt_problem,
         n_particles=train_cfg.n_smc_particles,
-        engine={"name": "mala"},
-        n_mcmc_steps=train_cfg.mppt_n_mcmc_steps,
-        local_ess_ratio=train_cfg.mppt_local_ess_ratio,
+        n_mcmc_steps=train_cfg.smc_n_mcmc_steps,
+        local_ess_ratio=train_cfg.smc_local_ess_ratio,
         verbose=True,
-        runtime_check=False,
-        keep_all_states=True,
-        keep_mcmc_params=True,
     )
     print(f"SMC done in {time.time()-t0:.1f}s")
     print(f"Temperature ladder ({len(betas_list)} levels): {[f'{b:.3f}' for b in betas_list]}")
     print(f"logZ estimates: {logZ_dict}")
 
     # Scalar MALA step size (ε), adapted per rung by SMC's own acceptance-rate
-    # bisection (HMCParameters.scaled_cov.eps) — the same value reused wherever
+    # bisection (MALAParameters.scaled_cov.eps) — the same value reused wherever
     # mcmc_params_by_rung is indexed below.
     _eps_by_rung = mcmc_params_by_rung.scaled_cov.eps
     print("MALA step size (ε) adapted by SMC, per rung:")
@@ -638,8 +652,8 @@ if _ckpt_data is None:
     M = len(betas_list) - 1
     print(f"M={M} non-reference temperature levels")
 
-    # Project the SMC particles onto the zero-CoM subspace. MPPT's MCMC engines
-    # do not project (nothing in mppt/impl/mcmc_*.py touches the CoM). DW4 uses
+    # Project the SMC particles onto the zero-CoM subspace. The MALA kernel does
+    # not project (nothing in mala_kernel.py touches the CoM). DW4 uses
     # trap_scale=0, so the energy is exactly translation-invariant and the CoM
     # is an entirely free direction under MCMC — only the reference term in the
     # geometric path confines it at all, and not at β=1. Everything downstream
@@ -661,7 +675,7 @@ else:
     print(f"M={M} non-reference temperature levels")
 
 # %% [markdown]
-# ### SMC seed quality at $\beta = 1$
+# ## 10. SMC Seed Quality at $\beta = 1$
 #
 # The top rung of the ladder targets $\pi_{\beta_M} = \pi$ — the same
 # distribution the reference set is drawn from — so the two should agree. This
@@ -783,8 +797,8 @@ if _ckpt_data is None:
         print(f"  Buffer {_k} (β={float(betas[_k]):.3f}): {buffers[_k].size} samples{_frozen}")
 
     # Buffer 1 is never written during training (the outer loop fills 2..M), so
-    # it stays frozen — but it now holds real π_{β_1} particles rather than
-    # buffer 0 reweighted, so its ESS starts at 1.0.
+    # it stays frozen. It holds genuine π_{β_1} particles from SMC, so its ESS
+    # is 1.0.
     if len(betas_list) >= 2:
         buffers[1].freeze()
     print(f"Seeding done in {time.time()-t0:.1f}s")
@@ -817,12 +831,12 @@ def _data_gen_parallel(
     T,                   # static float
     n_sde_steps,         # static int
     n_mala_steps,        # static int
-    mppt_problem,        # static -- mppt.PTProblem, same object SMC ran with
+    pt_problem,          # static -- PTProblem, same object SMC ran with
     params,              # network pytree
     betas_active,        # (M_active,)
     betas_next,          # (M_active,)
     t_idx_active,        # (M_active,) rung indices k = 1 … M-1, matching betas_active
-    mcmc_params_active,  # HMCParameters pytree (leading axis M_active), SMC-tuned per rung
+    mcmc_params_active,  # MALAParameters pytree (leading axis M_active), SMC-tuned per rung
 ):
     """Run full data-generation pipeline for all active temperature levels via vmap."""
     score_clip = train_cfg.score_clip
@@ -850,8 +864,8 @@ def _data_gen_parallel(
         resample_idx = systematic_resample(resample_key, log_w_path, n_particles)
         x0_resampled = x0_batch[resample_idx]
         # 3. MALA rejuvenation, using the same SMC-tuned kernel from Section 9
-        x0_rejuv, mala_acc = mppt_rejuvenate(
-            mala_key, x0_resampled, mppt_problem, beta_k, t_idx_k,
+        x0_rejuv, mala_acc = rejuvenate(
+            mala_key, x0_resampled, pt_problem, beta_k, t_idx_k,
             mcmc_params_k, n_mala_steps, project_fn=project_com,
         )
         # 4. IS bridge weights
@@ -871,9 +885,10 @@ def _data_gen_parallel(
 # %% [markdown]
 # ## 13. Training Step (Inner Loop)
 #
-# DDPM regression target for DW4:
+# Target Score Matching (TSM) target for DW4, built from the score of the
+# clean sample $x_0$:
 # $$\phi(x_0,t,\beta) = e^{-t}\,\beta\,(x_0 - \nabla E(x_0))$$
-# EGNN is called on the full batch `(M*B, 8)` directly (no per-sample vmap).
+# EGNN is called on the full batch `((M+1)*B, 8)` directly (no per-sample vmap).
 # Forward-noised samples are projected to zero CoM before passing to the network.
 
 # %%
@@ -888,7 +903,7 @@ opt_state = optimizer.init(params)
 def train_step(params, opt_state, x0_all, t_all, beta_all, key):
     """Loss, gradient, and Adam update.
 
-    x0_all: (M*B, 8), t_all: (M*B,), beta_all: (M*B,)
+    x0_all: ((M+1)*B, 8), t_all: ((M+1)*B,), beta_all: ((M+1)*B,)
     """
     target_clip = train_cfg.target_clip_norm
     score_clip = train_cfg.score_clip
@@ -904,7 +919,7 @@ def train_step(params, opt_state, x0_all, t_all, beta_all, key):
         xt_all = means + sigma_t[:, None] * eps
         xt_all = jax.vmap(project_com)(xt_all)  # project to zero CoM
 
-        # DDPM targets (stop_gradient: no backprop through energy Hessian)
+        # TSM targets (stop_gradient: no backprop through energy Hessian)
         def phi_one(x0_i, t_i, beta_i):
             lambda_t = jnp.exp(-t_i)
             grad_e = jax.grad(energy)(x0_i)
@@ -1032,7 +1047,7 @@ def periodic_eval_plot(params, outer_step):
 #         buffer[k+1].add(x₀, log w_{k→k+1})
 #     for inner_step in 1 … n_inner_steps:
 #         sample mini-batches from each buffer
-#         project-noised xt, compute DDPM targets
+#         project-noised xt, compute TSM targets
 #         Adam step on joint loss via batched EGNN
 # ```
 
@@ -1078,7 +1093,7 @@ for outer_step in range(start_outer_step, train_cfg.num_outer_steps):
         mala_keys   = all_keys[2 * M_active + 1:]
 
         # Active rungs are k = 1 … M-1 (M_active of them); mcmc_params_by_rung[k-1]
-        # is the HMCParameters SMC tuned for rung k (Section 9), so slice its
+        # is the MALAParameters SMC tuned for rung k (Section 9), so slice its
         # first M_active entries to match betas[1:-1].
         t_idx_active = jnp.arange(1, M)
         mcmc_params_active = jax.tree_util.tree_map(
@@ -1091,7 +1106,7 @@ for outer_step in range(start_outer_step, train_cfg.num_outer_steps):
             model_cfg.x_dim, train_cfg.n_particles,
             train_cfg.T, train_cfg.n_sde_steps_train,
             train_cfg.n_mala_rejuv,
-            mppt_problem,
+            pt_problem,
             params, betas[1:-1], betas[2:],
             t_idx_active, mcmc_params_active,
         )
@@ -1182,7 +1197,7 @@ for outer_step in range(start_outer_step, train_cfg.num_outer_steps):
         print(f"  Checkpoint saved at step {outer_step+1}")
 
     # ---- Periodic evaluation ----
-    if (outer_step + 1) % train_cfg.eval_every == 0:
+    if train_cfg.eval_every is not None and (outer_step + 1) % train_cfg.eval_every == 0:
         periodic_eval_plot(params, outer_step)
 
 print(f"\nTraining complete in {time.time()-train_start:.1f}s")
@@ -1190,7 +1205,7 @@ print(f"\nTraining complete in {time.time()-train_start:.1f}s")
 # %% [markdown]
 # ### Reference Samples
 #
-# Pre-computed ground-truth samples are loaded from `data/dw4_samples.npz`
+# The standard DW4 test split is loaded from `data/test_split_DW4.npy`
 # (set once in Section 2 above). Nothing to re-run here.
 
 # %%
@@ -1204,14 +1219,14 @@ print(f"Max |CoM| in reference samples: {jnp.abs(_ref_com).max():.2e}  (should b
 # ## 16. Final Evaluation
 #
 # Run the backward SDE at $\beta=1$ and compare the distribution of pairwise
-# inter-particle distances to the MPPT ground-truth reference.
+# inter-particle distances to the ground-truth reference samples.
 
 # %%
 print("Running final evaluation …")
 key, subkey = jax.random.split(key)
 x0_eval, lw_eval = _run_backward_sde(
     subkey, params, betas[-1], energy,
-    model_cfg.x_dim, train_cfg.n_eval_particles,
+    model_cfg.x_dim, train_cfg.n_eval_samples,
     train_cfg.T, train_cfg.n_sde_steps_eval,
 )
 ess_eval = float(normalized_ess(lw_eval))
@@ -1252,7 +1267,7 @@ x_resamp = x0_eval[resamp_idx]
 # once those weights are applied. `.sample()` applies them.
 if buffers[M].is_ready(1):
     key, subkey = jax.random.split(key)
-    n_buf = min(train_cfg.n_eval_particles, buffers[M].size)
+    n_buf = min(train_cfg.n_eval_samples, buffers[M].size)
     x_buf, _ = buffers[M].sample(subkey, n_buf)
     buf_ess = float(normalized_ess(buffers[M].log_weights[: buffers[M].size]))
 else:
@@ -1272,7 +1287,7 @@ sample_sets = [
 # Columns: the three candidate sample sets, plus the loss curve.
 # Rows: the two summary statistics. Distances say whether the *geometry* is
 # right, energy says whether the *physics* is right — energy is the sharper
-# test. Every panel carries the same dashed ground-truth reference, so the
+# test. Every panel carries the same filled ground-truth reference, so the
 # three sets are read against each other rather than each against its own axis.
 fig, axes = plt.subplots(2, 4, figsize=(21, 8))
 
@@ -1333,6 +1348,88 @@ print("  " + "─" * 62)
 print(f"  {'reference':<12}{float(_REF_E.mean()):>13.2f}"
       f"{float(jnp.median(_REF_E)):>13.2f}{float(_REF_R.mean()):>11.4f}{'—':>13}")
 print()
+
+# %% [markdown]
+# ### Reported metrics: Distance-𝒲₂, Energy-𝒲₂, Geometric-𝒲₂
+#
+# The three numbers reported for the method, computed by
+# `progressive_is_tempering.utils.metrics`; lower
+# is better for all three.
+#
+# - **Distance-𝒲₂** — 𝒲₂ between the pooled pairwise distances (6 per
+#   configuration), all thrown into one 1-D distribution.
+# - **Energy-𝒲₂** — 𝒲₂ between the energy distributions. Non-finite energies
+#   are dropped first.
+# - **Geometric-𝒲₂** — exact optimal transport between configurations, with the
+#   ground distance taken modulo particle permutation and rotation/reflection:
+#   linear assignment on unaligned coordinates first, then orthogonal
+#   Procrustes over O(2). That one-shot alignment is an upper bound on the true
+#   ground distance, and matches the published definition.
+#
+# Every sample set is scored against the whole reference set
+# (10,000 configurations); a set larger than that is first subsampled to the
+# same size, without replacement and with a fixed seed. Geometric-𝒲₂ needs one
+# alignment per (sample, reference) pair — 10⁸ at 10k × 10k — and runs on all
+# CPU cores but one: about 1.5 min on 48 cores per sample set.
+#
+# Each set is also written as its own record,
+# `results/dw4/[seedN/]<run_id>/metrics.json` with `run_id` ∈ {`sde_raw`, `sde_is`,
+# `buffer`}, under the metric names `w2_pooled` (Distance-𝒲₂), `w2_energy`
+# (Energy-𝒲₂) and `geometric_w2` (Geometric-𝒲₂). A
+# record also carries the energy means, the ESS and the full configuration.
+# A new run overwrites the previous run's records in the same folder.
+
+# %%
+_ref_np = np.asarray(_pt_ref)
+_ref_r_np, _ref_e_np = np.asarray(_REF_R), np.asarray(_REF_E)
+_metric_rng = np.random.default_rng(SEED)
+
+# Each set's record goes to results/<target>/<run_id>/metrics.json.
+RUN_IDS = {"SDE raw": "sde_raw", "SDE + IS": "sde_is", "buffer[M]": "buffer"}
+
+reported_metrics = {}
+print(f"── Reported metrics vs {_ref_np.shape[0]:,} reference samples (lower is better) ──")
+print(f"  {'set':<12}{'n':>8}{'Distance-W2':>14}{'Energy-W2':>14}{'Geometric-W2':>15}")
+print("  " + "─" * 63)
+for _lbl, _short, _x, _sub in sample_sets:
+    if _x is None:
+        print(f"  {_short:<12}{'empty':>8}")
+        continue
+    _xn = np.asarray(_x)
+    if _xn.shape[0] > _ref_np.shape[0]:
+        _xn = _xn[_metric_rng.choice(_xn.shape[0], _ref_np.shape[0], replace=False)]
+    _t0 = time.time()
+    _e = np.asarray(get_energies(_xn))
+    _m = {
+        # w2_pooled = Distance-W2, w2_energy = Energy-W2.
+        "w2_pooled": distance_w2(np.asarray(get_pairwise_distances(_xn)), _ref_r_np),
+        "w2_energy": energy_w2(_e, _ref_e_np),
+        "geometric_w2": geometric_w2(
+            _xn, _ref_np, model_cfg.n_particles, model_cfg.spatial_dim
+        ),
+        # The gate on the three above: far off means the sampler is in the
+        # wrong region and the distances say little.
+        "energy_mean": float(_e[np.isfinite(_e)].mean()) if np.isfinite(_e).any() else None,
+        "energy_mean_ref": float(_ref_e_np[np.isfinite(_ref_e_np)].mean()),
+        "n_eval_samples": int(_xn.shape[0]),
+        "n_ref_samples": int(_ref_np.shape[0]),
+        # Path-space ESS of the one SDE run behind "SDE raw" and "SDE + IS";
+        # null for buffer[M], whose block-normalised weights estimate nothing.
+        "ess": None if _short == "buffer[M]" else ess_eval,
+        "path_ess": ess_eval,
+        "buffer_ess": buf_ess,
+    }
+    reported_metrics[_short] = _m
+    write_record(
+        RESULTS_DIR, NOTEBOOK_NAME, RUN_IDS[_short], _m, seed=SEED,
+        config={"model": model_cfg, "training": train_cfg,
+                "betas": [float(b) for b in betas_list]},
+        notes=f"Sample set: {_lbl} ({_sub}).",
+    )
+    print(f"  {_short:<12}{_xn.shape[0]:>8,}{_m['w2_pooled']:>14.4f}"
+          f"{_m['w2_energy']:>14.4f}{_m['geometric_w2']:>15.4f}"
+          f"   ({time.time() - _t0:.0f}s)")
+print(f"\nRecords written under {RESULTS_DIR}/<run_id>/metrics.json")
 
 # %%
 # Per-coordinate statistics (should have zero CoM)
@@ -1404,7 +1501,7 @@ else:
 from progressive_is_tempering.utils import honest_density_hist, reference_anchored_window
 
 _MERGED_COLORS = {
-    "SDE raw": "#2a78d6",
+    "SDE raw": C_TEST,
     "SDE + IS": "#2ca02c",
     "buffer[M]": "#9467bd",
 }
@@ -1418,8 +1515,8 @@ if _summary:
     _r_lo = max(_r_lo, 0.0)
     _e_lo, _e_hi = reference_anchored_window(_all_e, _REF_E)
 
-    honest_density_hist(ax_r, _REF_R, _r_lo, _r_hi, 150, "reference", C_REF, dashed=True)
-    honest_density_hist(ax_e, _REF_E, _e_lo, _e_hi, 150, "reference", C_REF, dashed=True)
+    honest_density_hist(ax_r, _REF_R, _r_lo, _r_hi, 150, "reference", C_REF, filled=True)
+    honest_density_hist(ax_e, _REF_E, _e_lo, _e_hi, 150, "reference", C_REF, filled=True)
     for _short, _e, _r, _frac in _summary:
         _color = _MERGED_COLORS.get(_short, C_INK_2)
         honest_density_hist(ax_r, _r, _r_lo, _r_hi, 150, _short, _color)

@@ -12,11 +12,13 @@ dependencies = [
     "flax",
     "optax",
     "jaxtyping",
+    "scipy",
+    "pot",
     "jax_pdf @ git+https://github.com/alexxthiery/jax-pdf.git",
 ]
 
 [project.optional-dependencies]
-test = ["pytest", "pytest-xdist", "chex"]
+test = ["pytest", "pytest-xdist"]
 
 [tool.setuptools.packages.find]
 where = ["."]

@@ -1,4 +1,0 @@
-- Add more plot diagnostics
-- Add options for final samples collection
-- Add LJ13 example
-- Add Phi4 and Neal's funnel examples (not working)
