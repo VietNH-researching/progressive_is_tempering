@@ -148,9 +148,9 @@ The notebooks do not call it; they use `rejuvenate.rejuvenate` below.
 
 ### `mala_kernel.py`
 
-Covariance-preconditioned MALA kernel on the geometric path
-`log π_t = (1-t)·logpdf_ref + t·logpdf_final_target`, written as one-step HMC with
-full velocity refresh.
+Covariance-preconditioned HMC kernel on the geometric path
+`log π_t = (1-t)·logpdf_ref + t·logpdf_final_target`, with a single leapfrog step
+and full velocity refresh.
 
 | Symbol | Description |
 |---|---|
@@ -176,7 +176,7 @@ full velocity refresh.
 
 | Symbol | Description |
 |---|---|
-| `rejuvenate(key, positions, problem, beta_k, t_idx_k, mcmc_params_k, n_steps, project_fn=None)` | `n_steps` MALA moves with the SMC-adapted kernel for rung `k`; returns `(positions_new, mean_accept_rate)`. `project_fn` (e.g. zero-CoM) is applied after every move. JIT-compiled with `static_argnums=(2, 6, 7)` |
+| `rejuvenate(key, positions, problem, beta_k, t_idx_k, mcmc_params_k, n_steps, project_fn=None)` | `n_steps` HMC moves with the SMC-adapted kernel for rung `k`; returns `(positions_new, mean_accept_rate)`. `project_fn` (e.g. zero-CoM) is applied after every move. JIT-compiled with `static_argnums=(2, 6, 7)` |
 
 ---
 

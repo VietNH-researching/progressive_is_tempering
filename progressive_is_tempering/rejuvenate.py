@@ -1,7 +1,7 @@
 """
-MALA rejuvenation with the SMC-adapted kernel.
+HMC rejuvenation with the SMC-adapted kernel.
 
-Reuses the exact covariance-preconditioned MALA kernel that
+Reuses the exact covariance-preconditioned HMC kernel that
 `progressive_is_tempering.smc.smc_sampler` already adapts per temperature
 rung (returned as its `mcmc_params`), instead of maintaining a second,
 independently-calibrated isotropic MALA implementation.
@@ -39,7 +39,7 @@ def rejuvenate(
     project_fn: Optional[Callable[[Array], Array]] = None,
 ) -> tuple[Array, Array]:
     """
-    Rejuvenate `positions` at rung (beta_k, t_idx_k) with the MALA kernel,
+    Rejuvenate `positions` at rung (beta_k, t_idx_k) with the HMC kernel,
     using the `MALAParameters` SMC already adapted for this rung.
 
     Returns ``(positions_new, mean_accept_rate)``.
@@ -67,7 +67,7 @@ def rejuvenate(
     mcmc_params_k : MALAParameters
         Step size / covariance preconditioner adapted for this rung.
     n_steps : int
-        Number of MALA moves to apply. Static.
+        Number of HMC moves to apply. Static.
     project_fn : callable, optional
         If given (e.g. a zero-center-of-mass projector), applied to the
         particle positions after *every* internal move, with the particle's

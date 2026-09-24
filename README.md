@@ -10,8 +10,8 @@ The algorithm trains a single β-conditioned score network `s_θ(x, t, β)` to s
 β₀ = 0  →  β₁  →  …  →  β_M = 1
 ```
 
-1. **Initialization.** An adaptive SMC sweep lays out the ladder, and returns a particle population and a tuned MALA kernel at every rung. The particles seed one replay buffer per rung.
-2. **Training.** Each outer step runs, for every intermediate rung in parallel: a backward SDE driven by the current network, systematic resampling on path-space importance weights, MALA rejuvenation with the rung's SMC kernel, and an importance-sampling bridge to the next rung, whose buffer receives the particles. An inner loop then trains the network jointly across all rungs with a Target Score Matching (TSM) loss.
+1. **Initialization.** An adaptive SMC sweep lays out the ladder, and returns a particle population and a tuned HMC kernel at every rung. The particles seed one replay buffer per rung.
+2. **Training.** Each outer step runs, for every intermediate rung in parallel: a backward SDE driven by the current network, systematic resampling on path-space importance weights, HMC rejuvenation with the rung's SMC kernel, and an importance-sampling bridge to the next rung, whose buffer receives the particles. An inner loop then trains the network jointly across all rungs with a Target Score Matching (TSM) loss.
 3. **Sampling.** The backward SDE at `β = 1`, optionally corrected by its path-space importance weights.
 
 Full mathematical details are in [docs/TECHNIQUES_SUMMARY.md](docs/TECHNIQUES_SUMMARY.md).
@@ -97,9 +97,9 @@ progressive_is_tempering/      # installable package
 ├── targets.py                 # GMMTarget
 ├── resampling.py              # systematic resampling + ESS
 ├── mala.py                    # isotropic MALA (standalone; not used by the notebooks)
-├── mala_kernel.py             # PTProblem + covariance-preconditioned MALA kernel
+├── mala_kernel.py             # PTProblem + covariance-preconditioned HMC kernel
 ├── smc.py                     # adaptive-temperature SMC (ladder construction)
-├── rejuvenate.py              # MALA rejuvenation with the SMC-adapted kernel
+├── rejuvenate.py              # HMC rejuvenation with the SMC-adapted kernel
 ├── sampler.py                 # backward SDE + path-space log-weights
 ├── buffer.py                  # per-temperature FIFO replay buffers
 ├── loss.py                    # Target Score Matching (TSM) loss

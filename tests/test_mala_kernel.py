@@ -5,7 +5,7 @@ Tests cover:
   - init_extend / reset_temperature: cached densities and gradients match the
     geometric anneal of the reference and final target.
   - adapt_params: preconditioner is the empirical covariance, step size lands
-    the one-move acceptance rate in the MALA target range, degenerate
+    the one-move acceptance rate in the HMC target range, degenerate
     covariance falls back to a diagonal Cholesky factor.
   - move: t_idx == 0 redraws from the reference; t_idx >= 1 is a genuine
     Metropolis step (a rejected proposal leaves the position unchanged).

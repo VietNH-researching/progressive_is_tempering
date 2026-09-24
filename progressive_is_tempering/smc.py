@@ -7,12 +7,12 @@ along the geometric path. Each step:
 1. bisects for the next temperature at which reweighting drops the
    normalized ESS to `local_ess_ratio`;
 2. reweights and systematically resamples;
-3. adapts the MALA kernel (`mala_kernel`) at the new rung and runs
+3. adapts the HMC kernel (`mala_kernel`) at the new rung and runs
    `n_mcmc_steps` moves;
 4. estimates the local log normalizing-constant ratio with three estimators.
 
 `smc_sampler` returns the particle block at every rung, the ladder, the
-cumulative log Z estimates, and the MALA parameters adapted at every rung.
+cumulative log Z estimates, and the HMC parameters adapted at every rung.
 """
 
 from __future__ import annotations
@@ -255,7 +255,7 @@ class OneStepSMCResult(NamedTuple):
     logZ_local : dict[str, Array]
         Local log(Z_{t_next} / Z_t), one entry per estimator.
     niter_mcmc : int
-        Number of MALA moves applied.
+        Number of HMC moves applied.
     mcmc_params : MALAParameters
         Kernel parameters adapted at, and used for, the new rung.
     """
@@ -270,7 +270,7 @@ def one_step_smc(key, x: MALAParticle, problem: PTProblem, niter_mcmc: int,
                  new_ess_ratio: float = 0.5) -> OneStepSMCResult:
     """
     One SMC annealing step: next temperature, reweight + resample, adapt the
-    MALA kernel at the new rung, run `niter_mcmc` moves, estimate local log Z.
+    HMC kernel at the new rung, run `niter_mcmc` moves, estimate local log Z.
     """
     # Choose next temperature
     t_next = _get_next_temperature(x, new_ess_ratio, 1e-2)
@@ -333,7 +333,7 @@ def smc_sampler(key, problem: PTProblem, n_particles: int, n_mcmc_steps: int,
     n_particles : int
         Population size (constant across rungs).
     n_mcmc_steps : int
-        MALA moves per rung after resampling (>= 0).
+        HMC moves per rung after resampling (>= 0).
     local_ess_ratio : float in (0, 1)
         Each new temperature is chosen so that reweighting to it drops the
         normalized ESS to this value.

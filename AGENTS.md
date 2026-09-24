@@ -8,7 +8,7 @@ This is the single source of truth for agent and contributor guidance; see also
 
 **Name**: `progressive_is_tempering`
 
-**What it is**: A JAX research implementation of the Sequential Score Sampler (SSS), the method of the paper *Amortizing Tempered Sampling with Corrected Self-Training*: a sequential training algorithm for a score-based diffusion model targeting an unnormalized distribution with a tractable energy function. The key idea is to maintain a temperature ladder from an easy reference distribution to the target, iteratively generate training data at each temperature level via backward SDE sampling, correct for discretization error using importance weights and MALA rejuvenation, bridge particles to adjacent temperature levels, and jointly train a single β-conditioned score network across all levels.
+**What it is**: A JAX research implementation of the Sequential Score Sampler (SSS), the method of the paper *Amortizing Tempered Sampling with Corrected Self-Training*: a sequential training algorithm for a score-based diffusion model targeting an unnormalized distribution with a tractable energy function. The key idea is to maintain a temperature ladder from an easy reference distribution to the target, iteratively generate training data at each temperature level via backward SDE sampling, correct for discretization error using importance weights and HMC rejuvenation, bridge particles to adjacent temperature levels, and jointly train a single β-conditioned score network across all levels.
 
 **Read first**: `docs/TECHNIQUES_SUMMARY.md` for the full mathematical
 description (temperature ladder construction + data generation + data correction + Neural Network training).
@@ -21,7 +21,7 @@ description (temperature ladder construction + data generation + data correction
 
 - None beyond the PyPI packages in `pyproject.toml`: every target energy
   (GMM, DW4, Lennard-Jones) is implemented in `targets.py`.
-- The SMC ladder construction and the MALA kernel are implemented in-package
+- The SMC ladder construction and the HMC kernel are implemented in-package
   (`smc.py`, `mala_kernel.py`); there is no other algorithmic dependency.
 - `utils/metrics.py` needs SciPy and POT (both in `pyproject.toml`). The
   notebooks additionally need matplotlib, which is not a package dependency.
@@ -68,9 +68,9 @@ progressive_is_tempering/          # repo root
 │   ├── targets.py                 # GMMTarget + DW4 / LennardJones particle energies
 │   ├── resampling.py              # systematic resampling + normalized ESS
 │   ├── mala.py                    # isotropic MALA step + step-size calibration (not used by the notebooks)
-│   ├── mala_kernel.py             # PTProblem + covariance-preconditioned MALA kernel on the tempered path
+│   ├── mala_kernel.py             # PTProblem + covariance-preconditioned HMC kernel on the tempered path
 │   ├── smc.py                     # adaptive-temperature SMC sampler (ladder + per-rung kernel params)
-│   ├── rejuvenate.py              # MALA rejuvenation with the SMC-adapted kernel
+│   ├── rejuvenate.py              # HMC rejuvenation with the SMC-adapted kernel
 │   ├── sampler.py                 # backward SDE with path-space log-weights
 │   ├── buffer.py                  # per-temperature FIFO replay buffers
 │   ├── loss.py                    # Target Score Matching (TSM) loss across temperature levels
@@ -150,13 +150,13 @@ from higher layers.
 
 1. **Temperature ladder** — call `smc.smc_sampler` with `mala_kernel.PTProblem(rvs_ref, logpdf_ref, logpdf_final_target)` to adaptively find `{β_k}` (local ESS ratio ≥ 0.5). It returns the `(M+1, N, d)` stack of particle blocks (one per rung, indexed to match the ladder), the cumulative log Z estimates, the ladder `betas`, and the stacked per-rung `MALAParameters` the kernel adapted. No parallel-tempering step follows: the ladder comes from SMC.
 
-   The MALA kernel does not project to the zero-CoM subspace. For molecular targets, project the SMC stack once at this boundary before any downstream use.
+   The HMC kernel does not project to the zero-CoM subspace. For molecular targets, project the SMC stack once at this boundary before any downstream use.
 
 2. **Reuse SMC's kernel — no separate calibration** — the per-rung `MALAParameters` returned by `smc_sampler` (preconditioner = Cholesky factor of the rung's empirical covariance; step size `ε` bisected to acceptance ∈ `[0.4, 0.65]`) are reused as-is for outer-loop rejuvenation. `mcmc_params_by_rung` is a *stacked* pytree with leading axis `M` (entry `k-1` belongs to rung `k`); index its leaves, not the NamedTuple. Each kernel was adapted on a population actually distributed as `π_{β_k}`, so no further calibration is needed.
 
 3. **Buffer initialization**
    - `buffer[0]`: fill to capacity with i.i.d. `N(0, I)` samples, log-weights `= 0` (uniform). Frozen for the entire run. Use exact draws, not the SMC `β=0` block — at `β_0 = 0` the reference is the target.
-   - `buffer[1..M]`: seed with that rung's whole SMC block as SMC returned it (no further MALA pass). Uniform log-weights — these particles are already `≈ π_{β_k}`, so bridge weights do **not** apply. `buffer[1]` is frozen (the outer loop writes only `2..M`).
+   - `buffer[1..M]`: seed with that rung's whole SMC block as SMC returned it (no further HMC pass). Uniform log-weights — these particles are already `≈ π_{β_k}`, so bridge weights do **not** apply. `buffer[1]` is frozen (the outer loop writes only `2..M`).
    - `buffer[2..M]`: additionally filled during the outer loop; FIFO retires the seed as new data arrives.
 
 **Outer loop** (one iteration = one data-generation pass)
@@ -193,9 +193,9 @@ Run the backward SDE at `β=1` with `n_sde_steps_eval >> n_sde_steps_train` (e.g
 
 ## Key patterns
 
-**`jax.lax` loops inside JIT** — `backward_sde_single` scans over the `N` backward time steps; `rejuvenate` runs its `n_steps` MALA moves with `lax.fori_loop` (via `repeated_batch_move`, or its own loop when `project_fn` is set). Never use Python `for` loops inside a JIT region — they unroll at trace time.
+**`jax.lax` loops inside JIT** — `backward_sde_single` scans over the `N` backward time steps; `rejuvenate` runs its `n_steps` HMC moves with `lax.fori_loop` (via `repeated_batch_move`, or its own loop when `project_fn` is set). Never use Python `for` loops inside a JIT region — they unroll at trace time.
 
-**`jax.vmap` for particle and level parallelism** — `backward_sde_batch` vmaps `backward_sde_single` over `n_particles`; the MALA kernel's `batch_move` vmaps one move over the `K` particles; the outer data generation vmaps `process_one` over temperature levels. These three vmap axes are entirely independent.
+**`jax.vmap` for particle and level parallelism** — `backward_sde_batch` vmaps `backward_sde_single` over `n_particles`; the HMC kernel's `batch_move` vmaps one move over the `K` particles; the outer data generation vmaps `process_one` over temperature levels. These three vmap axes are entirely independent.
 
 **`static_argnums` for shapes and callables** — anything that determines the XLA graph shape (`dim`, `n_particles`, `T`, `n_steps`, `n_mala_steps`), any callable (`energy_fn`, `score_apply_fn`, `project_fn`) and the `PTProblem` must be in `static_argnums`. Values in `static_argnums` must be Python-level constants (or hashable objects), not JAX arrays. `rejuvenate` must receive the *same* `PTProblem` object SMC ran with.
 

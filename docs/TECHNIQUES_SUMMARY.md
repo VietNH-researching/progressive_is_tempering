@@ -372,9 +372,8 @@ The particle positions at every rung, stacked as `(M+1, N_smc, d)` and indexed t
 match $\{\beta_k\}$. These are the only samples available before training that
 are actually distributed as $\pi_{\beta_k}$.
 
-The MCMC kernel parameters SMC adapted *at* each rung. The kernel is a
-single-leapfrog-step HMC with full velocity refresh — i.e. preconditioned MALA —
-whose preconditioner is the Cholesky factor of the empirical covariance of that
+The MCMC kernel parameters SMC adapted *at* each rung. The kernel is HMC with a
+single leapfrog step and full velocity refresh, whose preconditioner is the Cholesky factor of the empirical covariance of that
 rung's population and whose step size $\varepsilon$ is bisected to land the
 acceptance rate in $[0.4,0.65]$.
 
@@ -511,15 +510,15 @@ $$
 after which the cloud is approximately i.i.d. from $\pi_{\beta_k}$ — but with
 duplicates, since resampling copies high-weight particles.
 
-**Step 1c — MALA rejuvenation.** Apply `n_mala_rejuv` steps of the *SMC-tuned*
-preconditioned MALA kernel for rung $k$ (Phase 1, Step 2), which has $\pi_{\beta_k}$
+**Step 1c — HMC rejuvenation.** Apply `n_mala_rejuv` steps of the *SMC-tuned*
+preconditioned HMC kernel for rung $k$ (Phase 1, Step 2), which has $\pi_{\beta_k}$
 as its exact stationary distribution regardless of step size, thanks to its
 Metropolis correction:
 
 $$
 \{x_0^{(i)}\}
 \leftarrow
-\mathrm{MALA}_{k}\bigl(\{x_0^{(i)}\},\,\pi_{\beta_k},\,\varepsilon_k,\,L_k\bigr).
+\mathrm{HMC}_{k}\bigl(\{x_0^{(i)}\},\,\pi_{\beta_k},\,\varepsilon_k,\,L_k\bigr).
 $$
 
 This replaces duplicates with genuinely distinct configurations, which is what
@@ -731,7 +730,7 @@ The quantities worth watching, in the order they fail:
    score error there and nothing else.
 3. **Buffer ESS per level.** A buffer whose ESS is collapsing is training the
    network on a handful of distinct configurations however many rows it holds.
-4. **MALA acceptance per rung** — SMC targets $[0.4,0.65]$; a rung far outside it
+4. **HMC acceptance per rung** — SMC targets $[0.4,0.65]$; a rung far outside it
    means the reused kernel no longer suits the particles being fed to it.
 5. **Ladder spacing.** Tight clusters of $\beta_k$ mark where $\pi_\beta$ moves
    fast; a single large gap is where the bridge weights will degenerate.
@@ -745,7 +744,7 @@ The quantities worth watching, in the order they fail:
 ```text
 Initialization (once):
     run adaptive-ESS SMC from beta=0 to 1
-        -> ladder {beta_k}, keeping all rung states and per-rung MALA kernels
+        -> ladder {beta_k}, keeping all rung states and per-rung HMC kernels
     check seed quality at beta=1 (distribution + ancestral degeneracy)
     initialize score network s_theta
     buffer[0]     <- exact i.i.d. N(0,I), uniform weights            [frozen]
@@ -756,7 +755,7 @@ Training (num_outer_steps iterations):
     -- outer loop: levels k = 1 .. M-1, all in parallel via jax.vmap --
         run backward SDE at beta_k  -> K particles + path log-weights
         systematic resample         -> approx. i.i.d. from pi_{beta_k}
-        MALA rejuvenation with SMC's own kernel for rung k
+        HMC rejuvenation with SMC's own kernel for rung k
         IS bridge to beta_{k+1}: log w = d_beta * (-E(x) + 0.5||x||^2)
     -- sequential (Python buffer mutations) --
         normalize each block to mean weight 1, append to buffer[k+1]

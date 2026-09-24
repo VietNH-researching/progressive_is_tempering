@@ -55,7 +55,7 @@ for t in times:
 ### Particle and level parallelism: use `jax.vmap`
 
 - `backward_sde_batch` vmaps `backward_sde_single` over `n_particles`.
-- The MALA kernel's `batch_move` (used by `rejuvenate`) vmaps one move over the `K` particles.
+- The HMC kernel's `batch_move` (used by `rejuvenate`) vmaps one move over the `K` particles.
 - The outer data-generation step vmaps `process_one` over temperature levels.
 
 These three vmap axes are entirely independent and compose cleanly.

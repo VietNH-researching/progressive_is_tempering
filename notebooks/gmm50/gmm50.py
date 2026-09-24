@@ -125,8 +125,8 @@ class TrainingConfig:
     n_inner_steps: int = 10_000
     batch_size: int = 512           # B per temperature
 
-    # MALA rejuvenation (the SMC-tuned kernel; see rejuvenate)
-    n_mala_rejuv: int = 20          # MALA steps per outer step
+    # HMC rejuvenation (the SMC-tuned kernel; see rejuvenate)
+    n_mala_rejuv: int = 20          # HMC steps per outer step
 
     # IS clipping / score clipping (setting = 0: disabled for GMM)
     score_clip: float = 0.0
@@ -280,11 +280,11 @@ print(f"log_pi_1(0): {log_pi_beta(x0, 1.0):.4f} (= log_prob(0) = {target.log_pro
 # that are actually distributed according to $\pi_{\beta_k}$ at each level,
 # and are used to seed the replay buffers (Section 12).
 #
-# It additionally returns the per-rung MALA kernel
+# It additionally returns the per-rung HMC kernel
 # (covariance + step size) SMC itself adapted while building the ladder. That
 # kernel is reused as-is for outer-loop rejuvenation (Section 13); see
 # `rejuvenate`. The buffer seed (Section 12) uses SMC's particle output
-# directly, with no further MALA pass.
+# directly, with no further HMC pass.
 
 # %%
 pt_problem = PTProblem(
@@ -309,11 +309,11 @@ print(f"SMC done in {time.time()-t0:.1f}s")
 print(f"Temperature ladder ({len(betas_list)} levels): {[f'{b:.3f}' for b in betas_list]}")
 print(f"logZ estimates: {logZ_dict}")
 
-# Scalar MALA step size (ε), adapted per rung by SMC's own acceptance-rate
+# Scalar HMC step size (ε), adapted per rung by SMC's own acceptance-rate
 # bisection (MALAParameters.scaled_cov.eps) — the same value reused wherever
 # mcmc_params_by_rung is indexed below.
 _eps_by_rung = mcmc_params_by_rung.scaled_cov.eps
-print("MALA step size (ε) adapted by SMC, per rung:")
+print("HMC step size (ε) adapted by SMC, per rung:")
 for _k, _eps_k in enumerate(_eps_by_rung, start=1):
     print(f"  rung {_k} (β={betas_list[_k]:.3f}): ε={float(_eps_k):.5g}")
 
@@ -543,11 +543,11 @@ print(f"  ‖x0‖={jnp.linalg.norm(x0_ex):.3f}, ‖∇E‖={jnp.linalg.norm(gra
 print(f"  ‖φ‖={jnp.linalg.norm(phi):.3f},  λ_t={float(lambda_t):.3f}")
 
 # %% [markdown]
-# ## 9. MALA Rejuvenation
+# ## 9. HMC Rejuvenation
 #
 # Diversifies near-duplicate particles after resampling while preserving
 # $\pi_\beta$ as the exact stationary distribution. This uses the
-# covariance-preconditioned MALA kernel (`mala_kernel`) with the parameters SMC
+# covariance-preconditioned HMC kernel (`mala_kernel`) with the parameters SMC
 # (Section 3) already tuned per rung. See `rejuvenate` for details.
 #
 # Rung 0 (β=0) can't be demoed here: the kernel treats `t_idx=0` as "draw
@@ -556,7 +556,7 @@ print(f"  ‖φ‖={jnp.linalg.norm(phi):.3f},  λ_t={float(lambda_t):.3f}")
 # The demo below instead uses rung 1.
 
 # %%
-# Demonstrate MALA rejuvenation at rung 1, using SMC's own tuned kernel
+# Demonstrate HMC rejuvenation at rung 1, using SMC's own tuned kernel
 key, subkey = jax.random.split(key)
 x_init_demo = smc_particles[1][:20]
 key, subkey = jax.random.split(key)
@@ -564,7 +564,7 @@ x_mala_demo, mala_acc = rejuvenate(
     subkey, x_init_demo, pt_problem, betas[1], 1,
     _mcmc_params_for_rung(1), 5,
 )
-print(f"MALA demo (β={float(betas[1]):.3f}, rung 1, 5 steps): "
+print(f"HMC demo (β={float(betas[1]):.3f}, rung 1, 5 steps): "
       f"acceptance rate = {float(mala_acc):.3f}")
 
 # %% [markdown]
@@ -614,7 +614,7 @@ def normalize_log_weights(log_w: jnp.ndarray) -> jnp.ndarray:
 # (one `jax.vmap` over levels):
 # 1. Backward SDE at $\beta_k$ → $(x_0^{(i)}, \log w_\mathrm{path}^{(i)})$
 # 2. Systematic resample → approx. i.i.d. from $\pi_{\beta_k}$
-# 3. MALA rejuvenation with the SMC-tuned kernel for rung $k$
+# 3. HMC rejuvenation with the SMC-tuned kernel for rung $k$
 # 4. IS bridge weights → $\log w_{k \to k+1}$
 #
 # The buffer writes happen afterwards, outside the vmap (Section 13).
@@ -668,7 +668,7 @@ def _data_gen_parallel(
         # 2. Systematic resample
         resample_idx = systematic_resample(resample_key, log_w_path, n_particles)
         x0_resampled = x0_batch[resample_idx]
-        # 3. MALA rejuvenation, using the same SMC-tuned kernel from Section 3
+        # 3. HMC rejuvenation, using the same SMC-tuned kernel from Section 3
         x0_rejuv, mala_acc = rejuvenate(
             mala_key, x0_resampled, pt_problem, beta_k, t_idx_k,
             mcmc_params_k, n_mala_steps,
@@ -697,7 +697,7 @@ def _data_gen_parallel(
 # $\beta=0$ target, so exact draws beat SMC particles here.
 #
 # Buffers $1,\ldots,M$: seeded directly with this rung's **entire** SMC block —
-# the particles SMC itself already produced after its own reweight/resample/MALA
+# the particles SMC itself already produced after its own reweight/resample/HMC
 # move at that rung (Section 3), with no further rejuvenation applied here.
 # Seed size, SMC population and buffer capacity are one number
 # (`n_smc_particles`), so each buffer starts exactly full and nothing is
@@ -731,7 +731,7 @@ buffers[0].freeze()
 print(f"Buffer 0 (β=0): {buffers[0].size} samples, uniform weights [frozen]")
 
 # Buffers 1..M: the whole SMC block at the matching rung, no subsampling and no
-# further rejuvenation — SMC's own reweight/resample/MALA move (Section 3)
+# further rejuvenation — SMC's own reweight/resample/HMC move (Section 3)
 # already produced these. The permutation below is not selection (it selects
 # everything) but ordering insurance: FIFO evicts in index order, so if the SMC
 # block ever carried lineage structure in its row order, the first K rows
@@ -899,7 +899,7 @@ def periodic_eval_plot(params, outer_step):
 #     for k = 1, …, M−1:  (parallel via jax.vmap)
 #         backward SDE at β_k  →  (x₀, log w_path)
 #         systematic resample  →  approx. i.i.d. from π_{β_k}
-#         MALA rejuvenation
+#         HMC rejuvenation
 #         IS bridge weights    →  log w_{k→k+1}
 #         buffer[k+1].add(x₀, log w_{k→k+1})
 #     for inner_step in 1 … n_inner_steps:
@@ -976,7 +976,7 @@ for outer_step in range(start_outer_step, train_cfg.num_outer_steps):
 
         outer_ess_list = path_ess_all.tolist()
 
-        # Buffer writes are Python-level mutations; negligible vs. SDE/MALA compute.
+        # Buffer writes are Python-level mutations; negligible vs. SDE/HMC compute.
         for i in range(M_active):
             # Normalize each block on the way in so it is commensurable with
             # the uniform-weight SMC seed already in the buffer, and with

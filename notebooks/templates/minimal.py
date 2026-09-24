@@ -118,7 +118,7 @@ pt_problem = PTProblem(
 # ## 2. Temperature ladder via SMC
 #
 # One SMC sweep yields three things at once, all consumed below and none
-# recomputed: the ladder `{β_k}`, a particle block at every rung, and the MALA
+# recomputed: the ladder `{β_k}`, a particle block at every rung, and the HMC
 # kernel SMC adapted per rung (reused for outer-loop rejuvenation).
 
 # %%
@@ -205,7 +205,7 @@ def normalize_log_weights(log_w):
 #     for k = 1 … M-1:                 # vmapped in the real notebooks
 #         backward SDE at β_k       →  (x₀, log w_path)
 #         systematic resample       →  approx. i.i.d. from π_{β_k}
-#         MALA rejuvenation
+#         HMC rejuvenation
 #         IS bridge weights         →  log w_{k→k+1}
 #         buffer[k+1].add(...)
 #     for each inner step:

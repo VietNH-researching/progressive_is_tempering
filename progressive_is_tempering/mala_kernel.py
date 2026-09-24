@@ -1,12 +1,12 @@
 """
-Covariance-preconditioned MALA kernel on the geometric tempered path.
+Covariance-preconditioned HMC kernel on the geometric tempered path.
 
 The kernel targets
 
     log pi_t(x) = (1 - t) * logpdf_ref(x) + t * logpdf_final_target(x)
 
-and is written as HMC with a single Verlet step and a full velocity refresh
-(refresh rate 1), which is exactly MALA. Its preconditioner is the empirical
+and is HMC with a single leapfrog step and a full velocity refresh
+(refresh rate 1). Its preconditioner is the empirical
 covariance of a particle population, and its step size is bisected towards an
 acceptance rate in [0.4, 0.65].
 
@@ -85,12 +85,12 @@ class ScaledCov(NamedTuple):
 
 class MALAParameters(NamedTuple):
     """
-    MALA kernel parameters.
+    HMC kernel parameters.
 
     scaled_cov : ScaledCov
         Step size `eps` and preconditioner.
     refresh_rate : float
-        Velocity refresh rate; always 1.0 (full refresh = MALA).
+        Velocity refresh rate; always 1.0 (a fresh velocity every move).
     """
 
     scaled_cov: ScaledCov
@@ -129,12 +129,12 @@ _MALAParticleNoVeloc = namedtuple("_MALAParticleNoVeloc", _particle_fields)
 
 class MALAKernel(NamedTuple):
     """
-    The MALA kernel at one rung `(t, t_idx)`. Built by `mala_kernel`.
+    The HMC kernel at one rung `(t, t_idx)`. Built by `mala_kernel`.
 
     init_extend : (key, x) -> MALAParticle
         Wrap a position into a particle with a fresh N(0, I) velocity.
     move : (key, particle, params) -> MALAParticle
-        One MALA step. At `t_idx == 0` it instead draws a fresh particle from
+        One HMC step. At `t_idx == 0` it instead draws a fresh particle from
         the reference, ignoring the input.
     adapt_params : (key, particles) -> MALAParameters
         Empirical-covariance preconditioner + bisected step size.
@@ -247,7 +247,7 @@ def _vmapped_move(move_fn, key, x, params):
     return mover(subkeys, x)
 
 
-# Step-size bisection settings for MALA: target acceptance in [0.4, 0.65],
+# Step-size bisection settings for HMC: target acceptance in [0.4, 0.65],
 # initial upper bracket 1.25 * 1.65 / d**(1/6), at most 10 bisection updates.
 _TARGET_ACC_RANGE = (0.4, 0.65)
 _STEPSIZE_NITER_MAX = 10
@@ -256,7 +256,7 @@ _REFRESH_RATE = 1.0
 
 def mala_kernel(problem: PTProblem, t, t_idx) -> MALAKernel:
     """
-    Build the MALA kernel for rung `(t, t_idx)` of `problem`.
+    Build the HMC kernel for rung `(t, t_idx)` of `problem`.
 
     Parameters
     ----------

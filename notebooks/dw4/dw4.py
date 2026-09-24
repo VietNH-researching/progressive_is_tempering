@@ -123,8 +123,8 @@ class TrainingConfig:
     n_inner_steps: int = 1_000
     batch_size: int = 512        # B per temperature
 
-    # MALA rejuvenation (the SMC-tuned kernel; see rejuvenate)
-    n_mala_rejuv: int = 10        # MALA steps per particle per outer step
+    # HMC rejuvenation (the SMC-tuned kernel; see rejuvenate)
+    n_mala_rejuv: int = 10        # HMC steps per particle per outer step
 
     # Clipping (empirically tuned for DW4's EGNN score network)
     score_clip: float = 1e4
@@ -357,7 +357,7 @@ def rvs_ref(key: jnp.ndarray) -> jnp.ndarray:
 
 # %%
 # pt_problem is built here (rather than at the SMC call in Section 9) so
-# Section 7's MALA demo can also use it.
+# Section 7's HMC demo can also use it.
 pt_problem = PTProblem(
     rvs_ref=rvs_ref,
     logpdf_ref=logpdf_ref,
@@ -517,9 +517,9 @@ _com_demo = _x0_demo.reshape(-1, model_cfg.n_particles, model_cfg.spatial_dim).m
 print(f"  Max |CoM| in samples: {jnp.abs(_com_demo).max():.2e}  (should be ≈ 0)")
 
 # %% [markdown]
-# ## 7. CoM-Projected MALA Rejuvenation
+# ## 7. CoM-Projected HMC Rejuvenation
 #
-# Rejuvenation uses the covariance-preconditioned MALA kernel (`rejuvenate`,
+# Rejuvenation uses the covariance-preconditioned HMC kernel (`rejuvenate`,
 # from `progressive_is_tempering/rejuvenate.py`) with the parameters SMC
 # (Section 9) tunes per rung. The kernel has no CoM-awareness at all, so
 # `rejuvenate`'s `project_fn` hook re-projects to zero-CoM after *every*
@@ -544,7 +544,7 @@ _pts_mala, _mala_acc = rejuvenate(
     k_move, _pts, pt_problem, _demo_beta, _demo_t_idx, _demo_params, 5,
     project_fn=project_com,
 )
-print(f"MALA demo (β={float(_demo_beta):.3f}, rung 1, 5 steps): "
+print(f"HMC demo (β={float(_demo_beta):.3f}, rung 1, 5 steps): "
       f"acceptance rate = {float(_mala_acc):.3f}")
 
 # %% [markdown]
@@ -602,11 +602,11 @@ def normalize_log_weights(log_w: jnp.ndarray) -> jnp.ndarray:
 # that are actually distributed according to $\pi_{\beta_k}$ at each level,
 # and are used to seed the replay buffers (Section 11).
 #
-# It additionally returns the per-rung MALA kernel
+# It additionally returns the per-rung HMC kernel
 # (covariance + step size) SMC itself adapted while building the ladder. That
 # kernel is reused as-is for outer-loop rejuvenation (Section 12); see
 # `rejuvenate`. The buffer seed (Section 11) uses SMC's particle output
-# directly, with no further MALA pass. SMC moves with the same MALA kernel
+# directly, with no further HMC pass. SMC moves with the same HMC kernel
 # `rejuvenate` uses, so the captured kernel is calibrated for exactly that
 # acceptance regime.
 
@@ -619,7 +619,7 @@ if resume and CHECKPOINT_PATH.exists():
     with open(CHECKPOINT_PATH, "rb") as f:
         _ckpt_data = pickle.load(f)
     print(f"Checkpoint found: outer_step={_ckpt_data['outer_step']}, "
-          f"will restore temperature ladder, buffers, and the MALA kernel")
+          f"will restore temperature ladder, buffers, and the HMC kernel")
 
 if _ckpt_data is None:
     key, subkey = jax.random.split(key)
@@ -637,11 +637,11 @@ if _ckpt_data is None:
     print(f"Temperature ladder ({len(betas_list)} levels): {[f'{b:.3f}' for b in betas_list]}")
     print(f"logZ estimates: {logZ_dict}")
 
-    # Scalar MALA step size (ε), adapted per rung by SMC's own acceptance-rate
+    # Scalar HMC step size (ε), adapted per rung by SMC's own acceptance-rate
     # bisection (MALAParameters.scaled_cov.eps) — the same value reused wherever
     # mcmc_params_by_rung is indexed below.
     _eps_by_rung = mcmc_params_by_rung.scaled_cov.eps
-    print("MALA step size (ε) adapted by SMC, per rung:")
+    print("HMC step size (ε) adapted by SMC, per rung:")
     for _k, _eps_k in enumerate(_eps_by_rung, start=1):
         print(f"  rung {_k} (β={betas_list[_k]:.3f}): ε={float(_eps_k):.5g}")
 
@@ -649,7 +649,7 @@ if _ckpt_data is None:
     M = len(betas_list) - 1
     print(f"M={M} non-reference temperature levels")
 
-    # Project the SMC particles onto the zero-CoM subspace. The MALA kernel does
+    # Project the SMC particles onto the zero-CoM subspace. The HMC kernel does
     # not project (nothing in mala_kernel.py touches the CoM). DW4 uses
     # trap_scale=0, so the energy is exactly translation-invariant and the CoM
     # is an entirely free direction under MCMC — only the reference term in the
@@ -734,7 +734,7 @@ else:
 # The reference *is* the $\beta=0$ target, so exact draws beat SMC particles here.
 #
 # Buffers $1,\ldots,M$: seeded directly with this rung's **entire** SMC block —
-# the particles SMC itself already produced after its own reweight/resample/MALA
+# the particles SMC itself already produced after its own reweight/resample/HMC
 # move at that rung (Section 9), with no further rejuvenation applied here.
 # Seed size, SMC population and buffer capacity are one number
 # (`n_smc_particles`), so each buffer starts exactly full and nothing is
@@ -768,7 +768,7 @@ if _ckpt_data is None:
     print(f"Buffer 0 (β=0): {buffers[0].size} samples, uniform weights [frozen]")
 
     # Buffers 1..M: the whole SMC block at the matching rung, no subsampling and
-    # no further rejuvenation — SMC's own reweight/resample/MALA move (Section 9)
+    # no further rejuvenation — SMC's own reweight/resample/HMC move (Section 9)
     # already produced these, already projected to zero CoM. The permutation
     # below is not selection (it selects everything) but ordering insurance:
     # FIFO evicts in index order, so if the SMC block ever carried lineage
@@ -813,7 +813,7 @@ else:
 # For each active temperature level $k \in \{1,\ldots,M-1\}$ **in parallel**:
 # 1. Backward SDE at $\beta_k$ → $(x_0^{(i)}, \log w_\mathrm{path}^{(i)})$
 # 2. Systematic resample → approx. i.i.d. from $\pi_{\beta_k}$
-# 3. CoM-projected MALA rejuvenation
+# 3. CoM-projected HMC rejuvenation
 # 4. IS bridge weights → $\log w_{k \to k+1}$
 
 # %%
@@ -860,7 +860,7 @@ def _data_gen_parallel(
         # 2. Systematic resample
         resample_idx = systematic_resample(resample_key, log_w_path, n_particles)
         x0_resampled = x0_batch[resample_idx]
-        # 3. MALA rejuvenation, using the same SMC-tuned kernel from Section 9
+        # 3. HMC rejuvenation, using the same SMC-tuned kernel from Section 9
         x0_rejuv, mala_acc = rejuvenate(
             mala_key, x0_resampled, pt_problem, beta_k, t_idx_k,
             mcmc_params_k, n_mala_steps, project_fn=project_com,
@@ -1039,7 +1039,7 @@ def periodic_eval_plot(params, outer_step):
 #     for k = 1, …, M−1:  (parallel via jax.vmap)
 #         CoM-projected backward SDE at β_k  →  (x₀, log w_path)
 #         systematic resample  →  approx. i.i.d. from π_{β_k}
-#         CoM-projected MALA rejuvenation
+#         CoM-projected HMC rejuvenation
 #         IS bridge weights    →  log w_{k→k+1}
 #         buffer[k+1].add(x₀, log w_{k→k+1})
 #     for inner_step in 1 … n_inner_steps:
