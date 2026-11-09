@@ -20,6 +20,7 @@ progressive_is_tempering/          # repo root
 │   ├── resampling.py
 │   ├── mala.py
 │   ├── mala_kernel.py
+│   ├── hmc_kernel.py
 │   ├── smc.py
 │   ├── rejuvenate.py
 │   ├── sampler.py
@@ -75,8 +76,8 @@ progressive_is_tempering.<module>   (notebooks import each module directly;
         ├──► sampler      ──► sde
         ├──► buffer       ──► resampling
         ├──► mala
-        ├──► smc          ──► mala_kernel
-        ├──► rejuvenate   ──► mala_kernel
+        ├──► smc          ──► mala_kernel, hmc_kernel
+        ├──► rejuvenate   ──► mala_kernel, hmc_kernel
         ├──► loss
         ├──► targets
         ├──► resampling
@@ -84,6 +85,7 @@ progressive_is_tempering.<module>   (notebooks import each module directly;
         └──► net.score_network ──► net.embedding
                                └──► net.mlp
              net.egnn_jax      ──► net.embedding
+             hmc_kernel        ──► mala_kernel
 ```
 
 `progressive_is_tempering.utils` never imports from the core package (strictly one-directional).
@@ -163,12 +165,29 @@ and full velocity refresh.
 
 ---
 
+### `hmc_kernel.py`
+
+The same kernel with partial velocity refresh: refresh rate 0.07 (momentum
+persists across moves), step size bisected to acceptance `[0.8, 0.95]`, initial
+bracket `1.65 / d**(1/6)`. Only `adapt_params` differs from `mala_kernel`; the
+move is `mala_kernel`'s, reading the refresh rate from the parameters.
+
+| Symbol | Description |
+|---|---|
+| `hmc_kernel(problem, t, t_idx)` | `MALAKernel` for one rung, as `mala_kernel` but with the partial-refresh `adapt_params` |
+| `REFRESH_RATE`, `TARGET_ACC_RANGE` | `0.07`, `(0.8, 0.95)` |
+
+`smc.KERNELS = {"mala": mala_kernel, "hmc": hmc_kernel}` maps the `kernel`
+argument of `smc_sampler` and `rejuvenate` to these factories.
+
+---
+
 ### `smc.py`
 
 | Symbol | Description |
 |---|---|
-| `smc_sampler(key, problem, n_particles, n_mcmc_steps, local_ess_ratio, verbose=True)` | Adaptive ladder. Returns `(particles (M+1, N, d), logZ dict, temperatures list, stacked MALAParameters (M,))` |
-| `one_step_smc(key, x, problem, niter_mcmc, new_ess_ratio)` | One step: ESS-bisected next temperature → permuted systematic resampling → kernel adaptation → `niter_mcmc` moves → local log Z (SMC-like, robust, reverse-logistic) |
+| `smc_sampler(key, problem, n_particles, n_mcmc_steps, local_ess_ratio, verbose=True, kernel="mala")` | Adaptive ladder. Returns `(particles (M+1, N, d), logZ dict, temperatures list, stacked MALAParameters (M,))` |
+| `one_step_smc(key, x, problem, niter_mcmc, new_ess_ratio, kernel="mala")` | One step: ESS-bisected next temperature → permuted systematic resampling → kernel adaptation → `niter_mcmc` moves → local log Z (SMC-like, robust, reverse-logistic) |
 
 ---
 
@@ -176,7 +195,7 @@ and full velocity refresh.
 
 | Symbol | Description |
 |---|---|
-| `rejuvenate(key, positions, problem, beta_k, t_idx_k, mcmc_params_k, n_steps, project_fn=None)` | `n_steps` HMC moves with the SMC-adapted kernel for rung `k`; returns `(positions_new, mean_accept_rate)`. `project_fn` (e.g. zero-CoM) is applied after every move. JIT-compiled with `static_argnums=(2, 6, 7)` |
+| `rejuvenate(key, positions, problem, beta_k, t_idx_k, mcmc_params_k, n_steps, project_fn=None, project_invariant=False, return_energy=False)` | `n_steps` HMC moves with the SMC-adapted kernel for rung `k`; returns `(positions_new, mean_accept_rate)`, plus `energies` (read from the final HMC state) if `return_energy`. `project_fn` (e.g. zero-CoM) is applied after every move; `project_invariant` skips re-evaluating an energy the projection cannot change. JIT-compiled with `static_argnums=(2, 6, 7, 8, 9)` |
 
 ---
 
@@ -187,8 +206,10 @@ Backward SDE with path-space importance weights.
 | Symbol | Description |
 |---|---|
 | `backward_sde_step(key, x_n, t_n, dt, control)` | One exponential-integrator step; returns `(x_prev, log_step_weight, eps)` |
-| `backward_sde_single(key, control_fn, beta, energy_fn, dim, T, n_steps)` | Single-particle trajectory via `lax.scan`; returns `(x0, log_w)` |
-| `backward_sde_batch(key, control_fn, beta, energy_fn, dim, n_particles, T, n_steps)` | `n_particles` independent trajectories via vmap; returns `(x0_batch, log_w_batch)` |
+| `exponential_time_grid(T, n_steps, t_end)` | Log-spaced backward grid `T … t_end`, then 0; returns `(times, dts)` |
+| `power_time_grid(T, n_steps, power)` | Power-law backward grid `t_n = T (n/N)^power`; returns `(times, dts)` (LJ13 notebook) |
+| `backward_sde_single(key, control_fn, beta, energy_fn, dim, T, n_steps, t_end=None)` | Single-particle trajectory via `lax.scan`; uniform grid, or exponential with `t_end`; returns `(x0, log_w)` |
+| `backward_sde_batch(key, control_fn, beta, energy_fn, dim, n_particles, T, n_steps, t_end=None)` | `n_particles` independent trajectories via vmap; returns `(x0_batch, log_w_batch)` |
 
 Path-space log-weight formula:
 
@@ -203,9 +224,11 @@ log w = Σ_n [log p_ρ(x_n|x_{n-1}) - log q_θ(x_{n-1}|x_n)]
 
 | Symbol | Description |
 |---|---|
-| `ReplayBuffer(capacity, dim)` | Fixed-capacity FIFO buffer with IS-weighted sampling |
-| `.add(samples, log_weights)` | Append with circular FIFO eviction |
+| `ReplayBuffer(capacity, dim, store_grads=False)` | Fixed-capacity FIFO buffer with IS-weighted sampling; with `store_grads`, each row also holds `∇E(x)` (stored as one `[x \| ∇E]` array) |
+| `.add(samples, log_weights, grads=None)` | Append with circular FIFO eviction (`grads` required iff `store_grads`) |
 | `.sample(key, batch_size)` | Systematic resample by IS weights; returns `(samples, log_weights)` |
+| `.sample_with_grads(key, batch_size)` | Same draws as `.sample`; returns `(rows [x \| ∇E], log_weights)` in one gather |
+| `.data`, `.grads` | Stored samples / gradients, shape `(capacity, dim)` |
 | `.is_ready(min_size)` | True when ≥ `min_size` entries are valid |
 | `.is_bridge_log_weights(samples, energy_fn, beta_k, beta_next)` | `Δβ · (-E(x) + ½‖x‖²)`; static method |
 

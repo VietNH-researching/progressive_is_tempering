@@ -5,6 +5,8 @@ Tests cover:
   - ReplayBuffer.add: size tracking, FIFO eviction at capacity, data correctness.
   - ReplayBuffer.sample: shape, indices within valid range, weighted sampling bias.
   - ReplayBuffer.is_ready: threshold logic.
+  - store_grads: ∇E stored per row, `sample` / `sample_with_grads` draw the
+    same rows, argument checks.
   - ReplayBuffer.is_bridge_log_weights: formula correctness.
 """
 
@@ -126,3 +128,43 @@ class TestISBridgeLogWeights:
         # Not necessarily zero
         assert log_w.shape == (4,)
         assert jnp.all(jnp.isfinite(log_w))
+
+class TestReplayBufferGrads:
+    def _filled(self):
+        buf = ReplayBuffer(capacity=8, dim=2, store_grads=True)
+        x = jnp.arange(12, dtype=jnp.float32).reshape(6, 2)
+        buf.add(x, jnp.linspace(-1.0, 0.0, 6), 10.0 * x)
+        return buf, x
+
+    def test_rows_hold_samples_and_grads(self):
+        buf, x = self._filled()
+        assert jnp.array_equal(buf.data[:6], x)
+        assert jnp.array_equal(buf.grads[:6], 10.0 * x)
+
+    def test_sample_with_grads_matches_sample(self):
+        buf, _ = self._filled()
+        key = jax.random.PRNGKey(0)
+        xs, lw = buf.sample(key, 5)
+        rows, lw2 = buf.sample_with_grads(key, 5)
+        assert rows.shape == (5, 4)
+        assert jnp.array_equal(rows[:, :2], xs)
+        assert jnp.array_equal(rows[:, 2:], 10.0 * xs)
+        assert jnp.array_equal(lw, lw2)
+
+    def test_fifo_overwrites_grads_too(self):
+        buf, _ = self._filled()
+        buf.add(jnp.full((3, 2), -1.0), jnp.zeros(3), jnp.full((3, 2), -2.0))
+        assert jnp.array_equal(buf.grads[0], jnp.array([-2.0, -2.0]))  # wrapped
+        assert buf.size == 8
+
+    def test_argument_checks(self):
+        plain = ReplayBuffer(capacity=4, dim=2)
+        with pytest.raises(ValueError):
+            plain.add(jnp.ones((1, 2)), jnp.zeros(1), jnp.ones((1, 2)))
+        with pytest.raises(ValueError):
+            plain.sample_with_grads(jax.random.PRNGKey(0), 1)
+        with pytest.raises(AttributeError):
+            plain.grads
+        with_g = ReplayBuffer(capacity=4, dim=2, store_grads=True)
+        with pytest.raises(ValueError):
+            with_g.add(jnp.ones((1, 2)), jnp.zeros(1))

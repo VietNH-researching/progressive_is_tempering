@@ -5,16 +5,16 @@
   "run_id": "buffer",
   "seed": 2,
   "metrics": {
-    "w2_pooled": 0.19519767835308166,
-    "w2_energy": 0.12069357186520918,
-    "geometric_w2": 0.48436409581185436,
-    "energy_mean": -22.560609817504883,
+    "w2_pooled": 0.1885099347681429,
+    "w2_energy": 0.11255515481955818,
+    "geometric_w2": 0.47182694572649997,
+    "energy_mean": -22.544147491455078,
     "energy_mean_ref": -22.450393676757812,
     "n_eval_samples": 10000,
     "n_ref_samples": 10000,
     "ess": null,
-    "path_ess": 0.3406411409378052,
-    "buffer_ess": 0.7817153334617615
+    "path_ess": 0.39009106159210205,
+    "buffer_ess": 0.9082873463630676
   },
   "config": {
     "model": {
@@ -32,8 +32,8 @@
       "coords_range": 15.0
     },
     "training": {
-      "T": 4.0,
-      "t_min": 0.01,
+      "T": 2.0,
+      "t_min": 0.001,
       "n_sde_steps_train": 100,
       "n_sde_steps_eval": 2000,
       "num_outer_steps": 10,
@@ -48,6 +48,7 @@
       "n_smc_particles": 81920,
       "smc_local_ess_ratio": 0.2,
       "smc_n_mcmc_steps": 10,
+      "mcmc_kernel": "hmc",
       "log_every": 1,
       "save_every": 1,
       "eval_every": null,
@@ -58,13 +59,13 @@
       0.0,
       0.0361328125,
       0.16038131713867188,
-      0.42932167649269104,
-      0.6879103183746338,
-      0.8707753419876099,
+      0.4326014518737793,
+      0.6985695362091064,
+      0.91993248462677,
       1.0
     ]
   },
   "commit": null,
-  "timestamp": "2026-09-22T17:14:56Z",
-  "notes": "Sample set: buffer[M]  \u03b2=1.000 (buffer ESS=0.782)."
+  "timestamp": "2026-11-08T18:54:16Z",
+  "notes": "Sample set: buffer[M]  \u03b2=1.000 (buffer ESS=0.908)."
 }

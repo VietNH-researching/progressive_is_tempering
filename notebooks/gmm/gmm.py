@@ -39,6 +39,14 @@ from pathlib import Path
 # GPU alongside this one. Must precede `import jax`, since the value is read
 # once at backend init; `setdefault` lets the shell override it.
 os.environ.setdefault("XLA_PYTHON_CLIENT_PREALLOCATE", "false")
+# Deterministic GPU kernels: a given RUN_SEED then reproduces a run's numbers
+# exactly (same hardware and software versions). Without this, XLA may sum
+# GPU reductions and scatters in a different order in each process, and SMC's
+# adaptive ladder turns those last-bit differences into different results.
+if "--xla_gpu_deterministic_ops" not in os.environ.get("XLA_FLAGS", ""):
+    os.environ["XLA_FLAGS"] = (
+        os.environ.get("XLA_FLAGS", "") + " --xla_gpu_deterministic_ops=true"
+    ).strip()
 
 import jax
 import jax.numpy as jnp
@@ -112,7 +120,10 @@ class TrainingConfig:
     """All training / sampling hyperparameters."""
     # SDE
     T: float = 4.0
-    t_min: float = 0.01
+    # Smallest training time, and the last time of the backward SDE's
+    # exponential grid (T ... t_min, then 0), so the network is never queried
+    # below the times it was trained on.
+    t_min: float = 0.001
     n_sde_steps_train: int = 100    # backward SDE steps during training
     n_sde_steps_eval: int = 2000    # backward SDE steps during evaluation
 
@@ -152,6 +163,10 @@ class TrainingConfig:
     n_smc_particles: int = 81_920
     smc_local_ess_ratio: float = 0.5
     smc_n_mcmc_steps: int = 3
+    # MCMC kernel for SMC and rejuvenation: "hmc" = partial-refresh HMC
+    # (`hmc_kernel`, refresh 0.07, acceptance 0.8-0.95); "mala" = the
+    # full-refresh kernel (`mala_kernel`, acceptance 0.4-0.65).
+    mcmc_kernel: str = "hmc"
 
     # --- Derived: seed size and buffer capacity are the SMC population -------
     @property
@@ -303,6 +318,7 @@ smc_particles, logZ_dict, betas_list, mcmc_params_by_rung = smc_sampler(
     n_mcmc_steps=train_cfg.smc_n_mcmc_steps,
     local_ess_ratio=train_cfg.smc_local_ess_ratio,
     verbose=True,
+    kernel=train_cfg.mcmc_kernel,
 )
 print(f"SMC done in {time.time()-t0:.1f}s")
 print(f"Temperature ladder ({len(betas_list)} levels): {[f'{b:.3f}' for b in betas_list]}")
@@ -461,19 +477,23 @@ print(f"Input dim: {model_cfg.x_dim} + {model_cfg.time_embedding_dim} + {model_c
 #
 # Discretised with an **exponential integrator**, not Euler–Maruyama: freeze
 # $u_\theta$ at the start of each step and solve the remaining linear SDE
-# exactly. With $\Delta t=T/N$ and $t_n=n\,\Delta t$, stepping $n=N,\dots,1$:
-# $$x_{n-1}=\lambda\,x_n+(1-\lambda)\,u_\theta(x_n,t_n,\beta)+\sigma\,\varepsilon_n,
-#   \quad\lambda=e^{-\Delta t},\;\sigma^2=1-e^{-2\Delta t},\;
+# exactly. On a time grid $0=t_0<t_1<\dots<t_N=T$ with
+# $\Delta t_n=t_n-t_{n-1}$, stepping $n=N,\dots,1$:
+# $$x_{n-1}=\lambda_n\,x_n+(1-\lambda_n)\,u_\theta(x_n,t_n,\beta)+\sigma_n\,\varepsilon_n,
+#   \quad\lambda_n=e^{-\Delta t_n},\;\sigma_n^2=1-e^{-2\Delta t_n},\;
 #   \varepsilon_n\sim\mathcal{N}(0,I)$$
 #
-# To first order in $\Delta t$ this *is* Euler–Maruyama. The difference is that
-# at $u_\theta\equiv0$ it reproduces the exact OU kernel for any $\Delta t$, so
+# To first order in $\Delta t_n$ this *is* Euler–Maruyama. The difference is that
+# at $u_\theta\equiv0$ it reproduces the exact OU kernel for any $\Delta t_n$, so
 # the path weights of Section 7 vanish identically at $\beta=0$.
 #
-# The network is queried at $t_n\in\{\Delta t,\dots,T\}$, never at $t=0$. Training
-# draws $t\ge t_{\min}$, so any grid with $\Delta t<t_{\min}$ queries times the
-# network never saw — here the evaluation grid ($\Delta t=0.002$, $t_{\min}=0.01$)
-# does so for its last steps, $t\approx0.01$ down to $0.002$. See `progressive_is_tempering/sampler.py` and
+# The grid is **exponential** (log-spaced): $t_n=t_{\min}(T/t_{\min})^{(n-1)/(N-1)}$
+# for $n=1,\dots,N$, so steps shrink geometrically towards $t=0$ and the last one is
+# $t_{\min}=10^{-3}$ (a uniform grid with $N=100$ would end with a step of $0.04$).
+# The last step adds noise of scale $\sigma_1$ to the returned samples that no
+# control can remove, so a small terminal step matters far more than the step
+# count. The network is queried at $t_n\ge t_{\min}$ only — the times it is
+# trained on. See `progressive_is_tempering/sampler.py` and
 # `docs/TECHNIQUES_SUMMARY.md`.
 
 # %%
@@ -492,7 +512,8 @@ def _run_backward_sde(key, params, beta, energy_fn, dim, n_particles, T, n_steps
         if score_clip > 0:  # Python-level branch; evaluated at trace time
             s = jnp.clip(s, -score_clip, score_clip)
         return 2.0 * s
-    return backward_sde_batch(key, control, beta, energy_fn, dim, n_particles, T, n_steps)
+    return backward_sde_batch(key, control, beta, energy_fn, dim, n_particles, T, n_steps,
+                              t_end=train_cfg.t_min)
 
 
 # %% [markdown]
@@ -546,7 +567,8 @@ print(f"  ‖φ‖={jnp.linalg.norm(phi):.3f},  λ_t={float(lambda_t):.3f}")
 #
 # Diversifies near-duplicate particles after resampling while preserving
 # $\pi_\beta$ as the exact stationary distribution. This uses the
-# covariance-preconditioned HMC kernel (`mala_kernel`) with the parameters SMC
+# covariance-preconditioned HMC kernel (`train_cfg.mcmc_kernel`: partial-refresh
+# `hmc_kernel` by default, or full-refresh `mala_kernel`) with the parameters SMC
 # (Section 3) already tuned per rung. See `rejuvenate` for details.
 #
 # Rung 0 (β=0) can't be demoed here: the kernel treats `t_idx=0` as "draw
@@ -559,9 +581,10 @@ print(f"  ‖φ‖={jnp.linalg.norm(phi):.3f},  λ_t={float(lambda_t):.3f}")
 key, subkey = jax.random.split(key)
 x_init_demo = smc_particles[1][:20]
 key, subkey = jax.random.split(key)
-x_mala_demo, mala_acc = rejuvenate(
+x_mala_demo, mala_acc, _ = rejuvenate(
     subkey, x_init_demo, pt_problem, betas[1], 1,
-    _mcmc_params_for_rung(1), 5,
+    _mcmc_params_for_rung(1), 5, return_energy=True,
+    kernel=train_cfg.mcmc_kernel,
 )
 print(f"HMC demo (β={float(betas[1]):.3f}, rung 1, 5 steps): "
       f"acceptance rate = {float(mala_acc):.3f}")
@@ -614,7 +637,11 @@ def normalize_log_weights(log_w: jnp.ndarray) -> jnp.ndarray:
 # 1. Backward SDE at $\beta_k$ → $(x_0^{(i)}, \log w_\mathrm{path}^{(i)})$
 # 2. Systematic resample → approx. i.i.d. from $\pi_{\beta_k}$
 # 3. HMC rejuvenation with the SMC-tuned kernel for rung $k$
-# 4. IS bridge weights → $\log w_{k \to k+1}$
+# 4. IS bridge weights → $\log w_{k \to k+1}$, using the energy the final HMC
+#    state already carries (no extra evaluation)
+# 5. $\nabla E$ at each rejuvenated particle, computed once here and stored with
+#    it in the buffer, so the TSM loss (Section 13) reads it instead of
+#    recomputing it at every inner step
 #
 # The buffer writes happen afterwards, outside the vmap (Section 13).
 
@@ -649,6 +676,7 @@ def _data_gen_parallel(
     bridge_lw_all : (M_active, n_particles)
     path_ess_all  : (M_active,)
     mala_acc_all  : (M_active,)
+    grads_all     : (M_active, n_particles, dim)   ∇E at x0_rejuv_all
     """
     score_clip = train_cfg.score_clip  # Python constant; branch resolved at trace time
 
@@ -662,24 +690,28 @@ def _data_gen_parallel(
 
         # 1. Backward SDE
         x0_batch, log_w_path = backward_sde_batch(
-            sde_key, control, beta_k, energy_fn, dim, n_particles, T, n_sde_steps
+            sde_key, control, beta_k, energy_fn, dim, n_particles, T, n_sde_steps,
+            t_end=train_cfg.t_min,
         )
         # 2. Systematic resample
         resample_idx = systematic_resample(resample_key, log_w_path, n_particles)
         x0_resampled = x0_batch[resample_idx]
         # 3. HMC rejuvenation, using the same SMC-tuned kernel from Section 3
-        x0_rejuv, mala_acc = rejuvenate(
+        x0_rejuv, mala_acc, energies = rejuvenate(
             mala_key, x0_resampled, pt_problem, beta_k, t_idx_k,
-            mcmc_params_k, n_mala_steps,
+            mcmc_params_k, n_mala_steps, return_energy=True,
+            kernel=train_cfg.mcmc_kernel,
         )
-        # 4. IS bridge weights (inlined to avoid passing through a nested-JIT boundary)
+        # 4. IS bridge weights (inlined to avoid passing through a nested-JIT
+        #    boundary); `energies` come from the final HMC state.
         delta_beta = beta_next - beta_k
-        energies = jax.vmap(energy_fn)(x0_rejuv)
         norms_sq = jnp.sum(x0_rejuv ** 2, axis=-1)
         bridge_lw = delta_beta * (-energies + 0.5 * norms_sq)
         # Path-space ESS
         path_ess = normalized_ess(log_w_path)
-        return x0_rejuv, bridge_lw, path_ess, mala_acc
+        # 5. ∇E once per particle, stored with it in the buffer
+        grads_rejuv = jax.vmap(jax.grad(energy_fn))(x0_rejuv)
+        return x0_rejuv, bridge_lw, path_ess, mala_acc, grads_rejuv
 
     return jax.vmap(process_one)(
         sde_keys, resample_keys, mala_keys, betas_active, betas_next,
@@ -690,7 +722,9 @@ def _data_gen_parallel(
 # %% [markdown]
 # ## 12. Per-Temperature Replay Buffers (Seeded from SMC)
 #
-# Each level $k$ maintains a fixed-capacity FIFO buffer of $(x,\log w)$ pairs.
+# Each level $k$ maintains a fixed-capacity FIFO buffer of $(x,\log w)$ pairs;
+# each row also stores $\nabla E(x)$, computed once when the row is written,
+# for the TSM targets of Section 13.
 #
 # Buffer 0 ($\beta=0$): i.i.d. $\mathcal{N}(0,I)$, frozen. The reference *is* the
 # $\beta=0$ target, so exact draws beat SMC particles here.
@@ -714,7 +748,8 @@ def _data_gen_parallel(
 # %%
 # Initialize all replay buffers
 buffers: list[ReplayBuffer] = [
-    ReplayBuffer(capacity=train_cfg.buffer_capacity, dim=model_cfg.x_dim)
+    ReplayBuffer(capacity=train_cfg.buffer_capacity, dim=model_cfg.x_dim,
+                 store_grads=True)
     for _ in range(len(betas_list))
 ]
 
@@ -725,7 +760,10 @@ key, subkey = jax.random.split(key)
 buf0_samples = jax.random.normal(
     subkey, (train_cfg.buffer_capacity, model_cfg.x_dim)
 )
-buffers[0].add(buf0_samples, jnp.zeros(train_cfg.buffer_capacity))
+# At β = 0 the TSM target is 0 whatever ∇E is, so buffer 0 stores zeros
+# instead of evaluating it.
+buffers[0].add(buf0_samples, jnp.zeros(train_cfg.buffer_capacity),
+               jnp.zeros_like(buf0_samples))
 buffers[0].freeze()
 print(f"Buffer 0 (β=0): {buffers[0].size} samples, uniform weights [frozen]")
 
@@ -750,7 +788,8 @@ for _k in range(1, len(betas_list)):
     key, subkey = jax.random.split(key)
     _perm_seed = jax.random.permutation(subkey, smc_states.shape[1])[:_n_seed]
     _seed_k = smc_states[_k][_perm_seed]
-    buffers[_k].add(_seed_k, jnp.zeros(_seed_k.shape[0]))
+    buffers[_k].add(_seed_k, jnp.zeros(_seed_k.shape[0]),
+                    jax.vmap(jax.grad(target.energy))(_seed_k))
     _frozen = " [frozen]" if _k == 1 else ""
     print(f"  Buffer {_k} (β={float(betas[_k]):.3f}): {buffers[_k].size} samples{_frozen}")
 
@@ -778,10 +817,14 @@ opt_state = optimizer.init(params)
 
 # JIT-compiled train step: forward pass, gradient, and Adam update fused into one call
 @jax.jit
-def train_step(params, opt_state, x0_all, t_all, beta_all, key):
+def train_step(params, opt_state, xg_all, t_all, beta_all, key):
     """Loss, gradient, and Adam update in a single JIT-compiled call.
-    x0_all: ((M+1)*B, d), t_all: ((M+1)*B,), beta_all: ((M+1)*B,)
+    xg_all: ((M+1)*B, 2d) buffer rows [x0 | ∇E(x0)], t_all: ((M+1)*B,),
+    beta_all: ((M+1)*B,)
     """
+    _d = xg_all.shape[1] // 2
+    x0_all, g_all = xg_all[:, :_d], xg_all[:, _d:]
+
     def loss_fn(p):
         # Noise all samples
         B_total = x0_all.shape[0]
@@ -791,14 +834,14 @@ def train_step(params, opt_state, x0_all, t_all, beta_all, key):
         eps = jax.vmap(jax.random.normal, in_axes=(0, None))(noise_keys, (x0_all.shape[1],))
         xt_all = means + sigma_t[:, None] * eps
 
-        # Targets (stop_gradient: no backprop through energy)
-        def phi_one(x0_i, t_i, beta_i):
+        # Targets (stop_gradient: no backprop through energy); ∇E(x0) is read
+        # from the buffer row, not recomputed
+        def phi_one(x0_i, grad_e, t_i, beta_i):
             lambda_t = jnp.exp(-t_i)
-            grad_e = jax.grad(target.energy)(x0_i)
             return lambda_t * beta_i * (x0_i - grad_e)
 
         targets = jax.lax.stop_gradient(
-            jax.vmap(phi_one)(x0_all, t_all, beta_all)
+            jax.vmap(phi_one)(x0_all, g_all, t_all, beta_all)
         )
 
         # Predictions
@@ -962,7 +1005,7 @@ for outer_step in range(start_outer_step, train_cfg.num_outer_steps):
             lambda leaf: leaf[:M_active], mcmc_params_by_rung
         )
 
-        x0_rejuv_all, bridge_lw_all, path_ess_all, _ = _data_gen_parallel(
+        x0_rejuv_all, bridge_lw_all, path_ess_all, _, grads_all = _data_gen_parallel(
             sde_keys, resamp_keys, mala_keys,
             target.energy,
             model_cfg.x_dim, train_cfg.n_particles,
@@ -980,7 +1023,8 @@ for outer_step in range(start_outer_step, train_cfg.num_outer_steps):
             # Normalize each block on the way in so it is commensurable with
             # the uniform-weight SMC seed already in the buffer, and with
             # blocks written at earlier outer steps (Section 10).
-            buffers[i + 2].add(x0_rejuv_all[i], normalize_log_weights(bridge_lw_all[i]))
+            buffers[i + 2].add(x0_rejuv_all[i], normalize_log_weights(bridge_lw_all[i]),
+                               grads_all[i])
 
     # ---- Inner loop: gradient descent ----
     all_buffers_ready = all(
@@ -994,7 +1038,8 @@ for outer_step in range(start_outer_step, train_cfg.num_outer_steps):
             x0_batches, t_batches, beta_batches = [], [], []
             for k in range(len(betas_list)):
                 key, subkey = jax.random.split(key)
-                x0_k, _ = buffers[k].sample(subkey, train_cfg.batch_size)
+                # rows are [x0 | ∇E(x0)]: one gather for both
+                x0_k, _ = buffers[k].sample_with_grads(subkey, train_cfg.batch_size)
 
                 key, subkey = jax.random.split(key)
                 t_k = jax.random.uniform(

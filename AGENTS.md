@@ -21,8 +21,9 @@ description (temperature ladder construction + data generation + data correction
 
 - None beyond the PyPI packages in `pyproject.toml`: every target energy
   (GMM, DW4, Lennard-Jones) is implemented in `targets.py`.
-- The SMC ladder construction and the HMC kernel are implemented in-package
-  (`smc.py`, `mala_kernel.py`); there is no other algorithmic dependency.
+- The SMC ladder construction and the MCMC kernels are implemented in-package
+  (`smc.py`, `mala_kernel.py`, `hmc_kernel.py`); there is no other algorithmic
+  dependency.
 - `utils/metrics.py` needs SciPy and POT (both in `pyproject.toml`). The
   notebooks additionally need matplotlib, which is not a package dependency.
 
@@ -68,7 +69,8 @@ progressive_is_tempering/          # repo root
 │   ├── targets.py                 # GMMTarget + DW4 / LennardJones particle energies
 │   ├── resampling.py              # systematic resampling + normalized ESS
 │   ├── mala.py                    # isotropic MALA step + step-size calibration (not used by the notebooks)
-│   ├── mala_kernel.py             # PTProblem + covariance-preconditioned HMC kernel on the tempered path
+│   ├── mala_kernel.py             # PTProblem + covariance-preconditioned HMC kernel, full refresh ("mala")
+│   ├── hmc_kernel.py              # the same kernel with partial refresh ("hmc", the notebooks' default)
 │   ├── smc.py                     # adaptive-temperature SMC sampler (ladder + per-rung kernel params)
 │   ├── rejuvenate.py              # HMC rejuvenation with the SMC-adapted kernel
 │   ├── sampler.py                 # backward SDE with path-space log-weights
@@ -96,6 +98,7 @@ progressive_is_tempering/          # repo root
 │   ├── test_resampling.py
 │   ├── test_mala.py
 │   ├── test_mala_kernel.py
+│   ├── test_hmc_kernel.py
 │   ├── test_smc.py
 │   ├── test_rejuvenate.py
 │   ├── test_sampler.py
@@ -126,8 +129,8 @@ progressive_is_tempering.<module>   (notebooks import each module directly;
         ├──► sampler  ──► sde
         ├──► buffer   ──► resampling
         ├──► mala
-        ├──► smc      ──► mala_kernel
-        ├──► rejuvenate ──► mala_kernel
+        ├──► smc      ──► mala_kernel, hmc_kernel
+        ├──► rejuvenate ──► mala_kernel, hmc_kernel
         ├──► loss
         ├──► targets
         ├──► resampling
@@ -135,6 +138,7 @@ progressive_is_tempering.<module>   (notebooks import each module directly;
         └──► net.score_network ──► net.embedding
                                └──► net.mlp
              net.egnn_jax      ──► net.embedding
+             hmc_kernel        ──► mala_kernel
 ```
 
 Leaf modules (`sde`, `targets`, `resampling`, `mala`, `mala_kernel`, `loss`, `net.embedding`,
@@ -148,11 +152,11 @@ from higher layers.
 
 **Warmup** (once, before any gradient steps)
 
-1. **Temperature ladder** — call `smc.smc_sampler` with `mala_kernel.PTProblem(rvs_ref, logpdf_ref, logpdf_final_target)` to adaptively find `{β_k}` (local ESS ratio ≥ 0.5). It returns the `(M+1, N, d)` stack of particle blocks (one per rung, indexed to match the ladder), the cumulative log Z estimates, the ladder `betas`, and the stacked per-rung `MALAParameters` the kernel adapted. No parallel-tempering step follows: the ladder comes from SMC.
+1. **Temperature ladder** — call `smc.smc_sampler` with `mala_kernel.PTProblem(rvs_ref, logpdf_ref, logpdf_final_target)` and `kernel=train_cfg.mcmc_kernel` to adaptively find `{β_k}` (local ESS ratio ≥ 0.5). It returns the `(M+1, N, d)` stack of particle blocks (one per rung, indexed to match the ladder), the cumulative log Z estimates, the ladder `betas`, and the stacked per-rung `MALAParameters` the kernel adapted. No parallel-tempering step follows: the ladder comes from SMC.
 
    The HMC kernel does not project to the zero-CoM subspace. For molecular targets, project the SMC stack once at this boundary before any downstream use.
 
-2. **Reuse SMC's kernel — no separate calibration** — the per-rung `MALAParameters` returned by `smc_sampler` (preconditioner = Cholesky factor of the rung's empirical covariance; step size `ε` bisected to acceptance ∈ `[0.4, 0.65]`) are reused as-is for outer-loop rejuvenation. `mcmc_params_by_rung` is a *stacked* pytree with leading axis `M` (entry `k-1` belongs to rung `k`); index its leaves, not the NamedTuple. Each kernel was adapted on a population actually distributed as `π_{β_k}`, so no further calibration is needed.
+2. **Reuse SMC's kernel — no separate calibration** — the per-rung `MALAParameters` returned by `smc_sampler` (preconditioner = Cholesky factor of the rung's empirical covariance; step size `ε` bisected to acceptance ∈ `[0.8, 0.95]` for `"hmc"`, `[0.4, 0.65]` for `"mala"`) are reused as-is for outer-loop rejuvenation. `mcmc_params_by_rung` is a *stacked* pytree with leading axis `M` (entry `k-1` belongs to rung `k`); index its leaves, not the NamedTuple. Each kernel was adapted on a population actually distributed as `π_{β_k}`, so no further calibration is needed.
 
 3. **Buffer initialization**
    - `buffer[0]`: fill to capacity with i.i.d. `N(0, I)` samples, log-weights `= 0` (uniform). Frozen for the entire run. Use exact draws, not the SMC `β=0` block — at `β_0 = 0` the reference is the target.
@@ -163,20 +167,21 @@ from higher layers.
 
 All `M_active = M - 1` active levels (`k = 1 … M-1`) are processed in parallel inside a single `jax.vmap` call (`_data_gen_parallel`, inner function `process_one`):
 
-1. Backward SDE at `β_k` → `(x0_batch, log_w_path)` — K particles with path-space log-weights. GMM uses `sampler.backward_sde_batch`; DW4 / LJ13 use the notebook's `backward_sde_batch_com`, which projects to zero CoM after every step and calls the EGNN once per step on the whole batch.
+1. Backward SDE at `β_k` → `(x0_batch, log_w_path)` — K particles with path-space log-weights. GMM uses `sampler.backward_sde_batch`; DW4 / LJ13 use the notebook's `backward_sde_batch_com`, which projects to zero CoM after every step and calls the EGNN once per step on the whole batch. GMM16, GMM50 and DW4 run it on the exponential time grid (`t_end = t_min`); LJ13 on the power grid `t_n = T (n/N)²` (`sampler.power_time_grid`, T = 1.5, N = 55 train / 2000 eval). See `docs/TECHNIQUES_SUMMARY.md`.
 2. `systematic_resample(key, log_w_path, K)` → approximately i.i.d. draws from `π_{β_k}`.
-3. `rejuvenate(key, particles, pt_problem, β_k, k, mcmc_params_k, n_mala_rejuv[, project_fn])` → diversified particles, acceptance rate.
-4. IS log-weights to the next level, `(β_{k+1} − β_k)(−E(x) + ½‖x‖²)` (inlined in `process_one`; same formula as `ReplayBuffer.is_bridge_log_weights`).
+3. `rejuvenate(key, particles, pt_problem, β_k, k, mcmc_params_k, n_mala_rejuv[, project_fn, project_invariant, return_energy])` → diversified particles, acceptance rate (and, with `return_energy=True`, `E(x)` read from the final HMC state at no extra cost).
+4. IS log-weights to the next level, `(β_{k+1} − β_k)(−E(x) + ½‖x‖²)` (inlined in `process_one`; same formula as `ReplayBuffer.is_bridge_log_weights`). Every notebook takes `E(x)` from step 3.
+5. `∇E` at each rejuvenated particle, computed once and stored with it in the buffer (`ReplayBuffer(..., store_grads=True)`).
 
-After `jax.vmap` returns, buffer writes are sequential Python mutations: `buffers[k+1].add(x0_rejuv, normalize_log_weights(bridge_lw))`.
+After `jax.vmap` returns, buffer writes are sequential Python mutations: `buffers[k+1].add(x0_rejuv, normalize_log_weights(bridge_lw)[, grads])`.
 
 **Inner loop** (runs only once all buffers hold ≥ `batch_size` entries)
 
 For each of `n_inner_steps`:
 
-1. For every level `k`, draw a mini-batch from `buffer[k]` via `systematic_resample` on IS log-weights.
-2. Sample `t ~ Unif[t_min, T]`; apply OU forward noising `x_t = e^{-t} x_0 + σ_t ε`.
-3. Compute TSM targets `φ = e^{-t} β (x_0 - ∇E(x_0))` under `stop_gradient`.
+1. For every level `k`, draw a mini-batch from `buffer[k]` via `systematic_resample` on IS log-weights (`sample_with_grads`: rows `[x_0 | ∇E(x_0)]` in one gather).
+2. Sample `t ~ Unif[t_min, T]` (LJ13: `t = t_min + (T − t_min) u⁴`, `u ~ Unif[0, 1]`, concentrated near `t_min = 1e-4`); apply OU forward noising `x_t = e^{-t} x_0 + σ_t ε`.
+3. Compute TSM targets `φ = e^{-t} β (x_0 - ∇E(x_0))` under `stop_gradient` (read `∇E(x_0)` from the buffer row; buffer 0 stores zeros, since `φ = 0` at `β = 0`).
 4. Concatenate all `(M+1) * B` triples across temperatures; one Adam step with global-norm gradient clipping.
 
 **Evaluation / Sampling** (after training)
@@ -233,7 +238,15 @@ Run the backward SDE at `β=1` with `n_sde_steps_eval >> n_sde_steps_train` (e.g
 
 **vmap over temperature levels requires uniform `n_particles`** — the outer `jax.vmap` in `_data_gen_parallel` requires all levels to produce identically-shaped output arrays. You cannot use different particle counts per temperature without restructuring the outer loop.
 
-**`smc.py` / `mala_kernel.py` are order-sensitive** — keep arithmetic expression order, key splits, and `lax.cond` structure as they are when editing. Seemingly equivalent rewrites (merging the two half velocity steps, dropping the `t_idx == 0` branch in `move`, reusing `resampling.systematic_resample` in SMC) change the floating-point results or the random stream, so the same seed gives different results.
+**HMC particle gradient fields are NaN outside a jump's midpoint** — the kernel evaluates `∇log π` only where the leapfrog reads it (after the first half position step). `init_extend`, the jump endpoint, and therefore every particle a move returns carry log-density *values* only, with `gradlogpdf_*` filled with NaN as a tripwire. Do not read those fields from a returned particle; compute the gradient yourself if you need it.
+
+**`project_invariant=True` only for projection-invariant energies** — it tells `rejuvenate` that `logpdf_final_target` is unchanged by `project_fn`, so the re-projection after each move skips re-evaluating it. True for DW4 (pair distances, `trap_scale=0`); false for LJ13, whose harmonic trap depends on the CoM.
+
+**Reproducibility needs deterministic GPU ops** — every notebook (GMM16, GMM50, DW4, LJ13) sets `--xla_gpu_deterministic_ops=true` in `XLA_FLAGS` before importing JAX. Without it the same seed gives different results in different processes: XLA's GPU reductions and scatters may sum in a different order, and SMC's adaptive ladder turns last-bit differences into a different ladder. With it, a seed reproduces the committed `results/{gmm,gmm50,dw4}/seedN/*/metrics.json` exactly on the same hardware and software (produced on NVIDIA RTX 4500 Ada GPUs with JAX 0.9.0.1, whichever GPU index and with or without `scripts/run_seeds.sh`); other GPU models or JAX/CUDA versions may still differ in the last bits. LJ13's `results/lj13/seedN/` were produced with the flag, but a rerun has not yet confirmed them bit for bit.
+
+**Two kernels, selected by name** — `smc_sampler(..., kernel=...)` and `rejuvenate(..., kernel=...)` take `"hmc"` (`hmc_kernel`: one leapfrog step, partial velocity refresh 0.07 so momentum persists across moves, acceptance `[0.8, 0.95]`) or `"mala"` (`mala_kernel`: the same step with full refresh, acceptance `[0.4, 0.65]`; the package default). All four notebooks set `mcmc_kernel = "hmc"` in their training config. Pass `rejuvenate` the same `kernel` SMC ran with: the adapted `MALAParameters` carry that kernel's refresh rate and step size. `hmc_kernel` differs from `mala_kernel` only in `adapt_params` (its `move` is `mala_kernel`'s), and with `project_fn` set, `rejuvenate` carries the velocity across each re-projection for `"hmc"` instead of redrawing it.
+
+**`smc.py` / `mala_kernel.py` / `hmc_kernel.py` are order-sensitive** — keep arithmetic expression order, key splits, and `lax.cond` structure as they are when editing. Seemingly equivalent rewrites (merging the two half velocity steps, dropping the `t_idx == 0` branch in `move`, reusing `resampling.systematic_resample` in SMC) change the floating-point results or the random stream, so the same seed gives different results.
 
 ---
 

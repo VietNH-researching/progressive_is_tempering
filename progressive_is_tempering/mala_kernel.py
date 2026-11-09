@@ -14,9 +14,16 @@ This is the kernel `progressive_is_tempering.smc.smc_sampler` adapts at every
 rung while building the ladder; the adapted `MALAParameters` are then reused
 by `progressive_is_tempering.rejuvenate.rejuvenate` in the outer loop.
 
-Particles carry both the reference and the final-target log-density (and
-gradient), so moving a particle to a new temperature (`reset_temperature`)
-needs no re-evaluation of either density.
+Particles carry both the reference and the final-target log-density, so
+moving a particle to a new temperature (`reset_temperature`) needs no
+re-evaluation of either density.
+
+Gradients are evaluated only where the leapfrog reads them: at the midpoint
+of a jump (after the first half position step). Every other particle state --
+`init_extend`, the jump endpoint, and so any particle a move returns -- carries
+the log-density values only, with its gradient fields filled with NaN. The NaN
+is a tripwire: code that did read a stale gradient would turn the run NaN
+instead of silently using it.
 """
 
 from __future__ import annotations
@@ -102,7 +109,8 @@ class MALAParticle(NamedTuple):
     One particle (or, with a leading axis on every field, a population).
 
     `logpdf_target` / `gradlogpdf_target` refer to the particle's *current*
-    temperature; `logpdf_final_target` is the t=1 density.
+    temperature; `logpdf_final_target` is the t=1 density. The gradient fields
+    are NaN except at a jump's midpoint (see the module docstring).
     """
 
     position: Array
@@ -163,13 +171,16 @@ _bisection_type = namedtuple(
 )
 
 
-def bisection(f, xleft_, xright_, ftol, max_iter):
+def bisection(f, xleft_, xright_, ftol, max_iter, fleft_=None):
     """
     Root of a monotonic `f` by bisection, returning the left bracket.
 
     `f(xleft_)` and `f(xright_)` need not have opposite signs: while they
     share a sign, the bracket is shifted by its own width towards the smaller
     `|f|`. Stops once `|f(xleft)| <= ftol` or after `max_iter` updates.
+
+    `fleft_`, if given, is used as `f(xleft_)` instead of evaluating it (for
+    a caller that knows the value exactly).
     """
 
     def create(xleft, xright, fleft, fright, niter):
@@ -205,7 +216,8 @@ def bisection(f, xleft_, xright_, ftol, max_iter):
         cond_2 = s.niter < max_iter
         return jnp.logical_and(cond_1, cond_2)
 
-    init_val = create(xleft_, xright_, f(xleft_), f(xright_), 0)
+    fleft0 = f(xleft_) if fleft_ is None else fleft_
+    init_val = create(xleft_, xright_, fleft0, f(xright_), 0)
     return lax.while_loop(cond, loop, init_val).xleft
 
 
@@ -272,11 +284,19 @@ def mala_kernel(problem: PTProblem, t, t_idx) -> MALAKernel:
     MALAKernel
     """
 
-    def feed_extend(x: Array) -> _MALAParticleNoVeloc:
+    def feed_extend(x: Array, with_grad: bool = False) -> _MALAParticleNoVeloc:
+        # Gradients only when the caller will read them (the jump midpoint);
+        # otherwise the gradient fields are NaN, a tripwire for stale use.
         assert jnp.ndim(x) == 1
-        logpdf_ref, gradlogpdf_ref = value_and_grad(problem.logpdf_ref)(x)
-        logpdf_final_target, gradlogpdf_final_target = \
-            value_and_grad(problem.logpdf_final_target)(x)
+        if with_grad:
+            logpdf_ref, gradlogpdf_ref = value_and_grad(problem.logpdf_ref)(x)
+            logpdf_final_target, gradlogpdf_final_target = \
+                value_and_grad(problem.logpdf_final_target)(x)
+        else:
+            logpdf_ref = problem.logpdf_ref(x)
+            logpdf_final_target = problem.logpdf_final_target(x)
+            gradlogpdf_ref = jnp.full_like(x, jnp.nan)
+            gradlogpdf_final_target = jnp.full_like(x, jnp.nan)
         logpdf_target = geometric_anneal(t, logpdf_ref, logpdf_final_target)
         gradlogpdf_target = geometric_anneal(t, gradlogpdf_ref, gradlogpdf_final_target)
         return _MALAParticleNoVeloc(
@@ -293,10 +313,10 @@ def mala_kernel(problem: PTProblem, t, t_idx) -> MALAKernel:
         return MALAParticle(veloc=random.normal(key, shape=x.shape),
                             **feed_extend(x)._asdict())
 
-    def inner_extend(x: Array, v: Array) -> MALAParticle:
+    def inner_extend(x: Array, v: Array, with_grad: bool) -> MALAParticle:
         assert x.ndim == v.ndim == 1
         assert x.shape == v.shape
-        return MALAParticle(veloc=v, **feed_extend(x)._asdict())
+        return MALAParticle(veloc=v, **feed_extend(x, with_grad)._asdict())
 
     def check_shapes(x: MALAParticle):
         d, = x.position.shape
@@ -315,10 +335,11 @@ def mala_kernel(problem: PTProblem, t, t_idx) -> MALAKernel:
     def joint_logpdf(x: MALAParticle):
         return x.logpdf_target - 0.5 * jnp.sum(x.veloc**2)
 
-    def jump_pos(x: MALAParticle, params: MALAParameters) -> MALAParticle:
+    def jump_pos(x: MALAParticle, params: MALAParameters,
+                 with_grad: bool) -> MALAParticle:
         pos_new = x.position + \
                   0.5 * params.scaled_cov.eps * params.scaled_cov.chol @ x.veloc
-        return inner_extend(pos_new, x.veloc)
+        return inner_extend(pos_new, x.veloc, with_grad)
 
     def jump_veloc(x: MALAParticle, params: MALAParameters) -> MALAParticle:
         return x._replace(veloc=x.veloc + (
@@ -327,11 +348,12 @@ def mala_kernel(problem: PTProblem, t, t_idx) -> MALAKernel:
 
     def jump(x: MALAParticle, params: MALAParameters) -> MALAParticle:
         # Half position step, full velocity step (as two halves), half
-        # position step, then flip the velocity.
-        x = jump_pos(x, params)
+        # position step, then flip the velocity. Only the midpoint gradient is
+        # read; the endpoint needs the log-density value for Metropolis only.
+        x = jump_pos(x, params, with_grad=True)
         x = jump_veloc(x, params)
         x = jump_veloc(x, params)
-        x = jump_pos(x, params)
+        x = jump_pos(x, params, with_grad=False)
         return x._replace(veloc=-x.veloc)
 
     def refresh_veloc(key, x: MALAParticle, refresh_rate) -> MALAParticle:
@@ -387,7 +409,12 @@ def mala_kernel(problem: PTProblem, t, t_idx) -> MALAKernel:
             acc = _vmapped_move(core_move, key, x, params).accepted
             return jnp.mean(acc) - acc_default
 
-        eps_star = bisection(f, 0., eps_upper, acc_delta, _STEPSIZE_NITER_MAX)
+        # At eps = 0 the position does not move and every proposal is
+        # accepted, so f(0) is known without running a move. Same expression
+        # as `f`, so the same dtype and rounding.
+        f0 = jnp.mean(jnp.ones((N,), dtype=bool)) - acc_default
+        eps_star = bisection(f, 0., eps_upper, acc_delta, _STEPSIZE_NITER_MAX,
+                             fleft_=f0)
         return stepsize_to_params(eps_star)
 
     def reset_temperature(x: MALAParticle) -> MALAParticle:

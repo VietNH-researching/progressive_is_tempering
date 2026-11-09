@@ -2,15 +2,17 @@
 Unit tests for progressive_is_tempering.mala_kernel.
 
 Tests cover:
-  - init_extend / reset_temperature: cached densities and gradients match the
-    geometric anneal of the reference and final target.
+  - init_extend / reset_temperature: cached densities match the geometric
+    anneal of the reference and final target; gradient fields are NaN outside
+    a jump's midpoint.
   - adapt_params: preconditioner is the empirical covariance, step size lands
     the one-move acceptance rate in the HMC target range, degenerate
     covariance falls back to a diagonal Cholesky factor.
   - move: t_idx == 0 redraws from the reference; t_idx >= 1 is a genuine
-    Metropolis step (a rejected proposal leaves the position unchanged).
+    Metropolis step (a rejected proposal leaves the position unchanged), whose
+    proposal is the position-Verlet leapfrog with the true midpoint gradient.
   - bisection: finds the root of a monotone function, including when the
-    initial bracket does not contain it.
+    initial bracket does not contain it; a supplied `fleft_` replaces f(xleft).
 """
 
 import jax
@@ -25,6 +27,8 @@ from progressive_is_tempering.mala_kernel import (
     geometric_anneal,
     mala_kernel,
     repeated_batch_move,
+    MALAParameters,
+    _scaled_cov,
 )
 
 
@@ -50,9 +54,9 @@ class TestExtend:
         x = jnp.array([0.5, -1.0, 2.0])
         p = kernel.init_extend(jax.random.PRNGKey(0), x)
         expected = geometric_anneal(t, problem.logpdf_ref(x), problem.logpdf_final_target(x))
-        expected_grad = -(1 - t) * x - t * (x - 2.0)
         assert jnp.allclose(p.logpdf_target, expected)
-        assert jnp.allclose(p.gradlogpdf_target, expected_grad, atol=1e-6)
+        # Gradients are evaluated only at a jump's midpoint; elsewhere NaN.
+        assert jnp.all(jnp.isnan(p.gradlogpdf_target))
         assert p.veloc.shape == (3,)
         assert bool(p.accepted)
 
@@ -64,7 +68,6 @@ class TestExtend:
         y = batch_reset_temperature(x, mala_kernel(problem, 0.7, 2))
         z = batch_init_extend(key, pos, mala_kernel(problem, 0.7, 2))
         assert jnp.allclose(y.logpdf_target, z.logpdf_target)
-        assert jnp.allclose(y.gradlogpdf_target, z.gradlogpdf_target, atol=1e-6)
         assert jnp.all(y.temperature_idx == 2)
 
 
@@ -123,6 +126,28 @@ class TestMove:
         assert jnp.any(rejected)
         assert jnp.array_equal(y.position[rejected], x.position[rejected])
 
+    def test_move_is_leapfrog_with_true_midpoint_gradient(self):
+        # Small step: the proposal is accepted, and must equal a hand-written
+        # position-Verlet step using the exact gradient at the midpoint.
+        problem = _problem(3)
+        t = 0.6
+        kernel = mala_kernel(problem, t, 1)
+        cov = jnp.array([[1.0, 0.3, 0.0], [0.3, 2.0, 0.1], [0.0, 0.1, 0.5]])
+        params = MALAParameters(_scaled_cov(0.05, cov), 1.0)
+        x0 = jnp.array([0.5, -1.0, 2.0])
+        p = batch_init_extend(jax.random.PRNGKey(10), x0[None], kernel)
+        y = jax.tree_util.tree_map(lambda a: a[0], batch_move(jax.random.PRNGKey(11), p, params, kernel))
+        p = jax.tree_util.tree_map(lambda a: a[0], p)
+
+        eps, chol = params.scaled_cov.eps, params.scaled_cov.chol
+        logpi = lambda z: geometric_anneal(t, problem.logpdf_ref(z), problem.logpdf_final_target(z))
+        x_half = x0 + 0.5 * eps * chol @ p.veloc
+        v = p.veloc + eps * chol.T @ jax.grad(logpi)(x_half)
+        x_new = x_half + 0.5 * eps * chol @ v
+        assert bool(y.accepted)
+        assert jnp.allclose(y.position, x_new, atol=1e-6)
+        assert jnp.allclose(y.logpdf_target, logpi(x_new), atol=1e-5)
+
     def test_repeated_moves_reach_target(self):
         problem = _problem(2, mu=1.0)
         key = jax.random.PRNGKey(7)
@@ -139,6 +164,18 @@ class TestBisection:
     def test_bracketed_root(self):
         root = bisection(lambda x: x - 0.3, 0.0, 1.0, 1e-4, 50)
         assert abs(float(root) - 0.3) < 1e-3
+
+    def test_known_left_value_replaces_evaluation(self):
+        calls = []
+        def f(x):
+            calls.append(x)
+            return x - 0.3
+        a = bisection(f, 0.0, 1.0, 1e-4, 50)
+        n_without = len(calls)
+        calls.clear()
+        b = bisection(f, 0.0, 1.0, 1e-4, 50, fleft_=jnp.asarray(-0.3))
+        assert float(a) == float(b)
+        assert len(calls) == n_without - 1
 
     def test_root_outside_initial_bracket(self):
         root = bisection(lambda x: x - 2.5, 0.0, 1.0, 1e-4, 50)

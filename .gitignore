@@ -26,10 +26,13 @@ __pycache__/
 .agents/
 commit_message.txt
 
-# External reference code (not part of this repo)
-/modern_samplers/
-
 # Ablation experiments (not part of this repo). Imports from
 # progressive_is_tempering/ are fine; figures and results are copied out by
 # hand for the paper, so nothing under here is tracked.
 /ablations/
+
+# Personal workspace (not part of this repo): studying/ holds experimental
+# implementations and idea prototypes; references/ holds reference material
+# for things to implement.
+/studying/
+/references/

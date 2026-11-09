@@ -5,16 +5,16 @@
   "run_id": "sde_raw",
   "seed": 2,
   "metrics": {
-    "w2_pooled": 0.07240129325643133,
-    "w2_energy": 12119134390.257868,
-    "geometric_w2": 1.5853708725612883,
-    "energy_mean": 138702208.0,
-    "energy_mean_ref": -43.12718963623047,
+    "w2_pooled": 0.017578548292335933,
+    "w2_energy": 124.99823300419627,
+    "geometric_w2": 1.470417651100483,
+    "energy_mean": -32.860870361328125,
+    "energy_mean_ref": -43.127193450927734,
     "n_eval_samples": 10000,
     "n_ref_samples": 10000,
-    "ess": 0.000595867692027241,
-    "path_ess": 0.000595867692027241,
-    "buffer_ess": 0.4778999090194702
+    "ess": 0.093975730240345,
+    "path_ess": 0.093975730240345,
+    "buffer_ess": 0.3929296135902405
   },
   "config": {
     "model": {
@@ -32,15 +32,18 @@
       "coords_range": 15.0
     },
     "training": {
-      "T": 4.0,
-      "t_min": 0.01,
-      "n_sde_steps_train": 25,
-      "n_sde_steps_eval": 1000,
+      "T": 1.5,
+      "grid_power": 2.0,
+      "n_sde_steps_train": 55,
+      "n_sde_steps_eval": 2000,
+      "t_min": 0.0001,
+      "t_power": 4.0,
       "num_outer_steps": 50,
       "n_particles": 5000,
       "n_inner_steps": 1000,
       "batch_size": 512,
       "n_mala_rejuv": 2000,
+      "mcmc_kernel": "hmc",
       "score_clip": 10000.0,
       "target_clip_norm": 150.0,
       "learning_rate": 0.001,
@@ -57,15 +60,15 @@
     "betas": [
       0.0,
       0.001953125,
-      0.1033172607421875,
-      0.3029692769050598,
-      0.47722694277763367,
-      0.6569302082061768,
-      0.8552674055099487,
+      0.09941864013671875,
+      0.2964208126068115,
+      0.47231560945510864,
+      0.6495845913887024,
+      0.835742712020874,
       1.0
     ]
   },
   "commit": null,
-  "timestamp": "2026-09-24T03:05:50Z",
+  "timestamp": "2026-11-09T04:34:51Z",
   "notes": "Sample set: Backward SDE (raw, no IS) (unweighted, 10,000 particles)."
 }

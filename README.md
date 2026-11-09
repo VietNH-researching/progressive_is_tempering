@@ -78,6 +78,8 @@ for s in 0 1 2; do RUN_SEED=$s python gmm.py; done
 
 The reported results use seeds 0, 1 and 2 of every target, run in turn by `scripts/run_seeds.sh`.
 
+**Reproducibility.** All four scripts (GMM16, GMM50, DW4, LJ13) turn on deterministic GPU kernels (`--xla_gpu_deterministic_ops=true`), so `RUN_SEED=0`, `1` or `2` reproduces the committed `results/{gmm,gmm50,dw4}/seedN/*/metrics.json` exactly — on the same GPU model and software versions (NVIDIA RTX 4500 Ada, JAX 0.9.0.1). Other GPUs or JAX/CUDA versions can differ in the last bits, which SMC's adaptive temperature ladder amplifies into visibly different numbers.
+
 ---
 
 ## Running the tests
@@ -97,7 +99,8 @@ progressive_is_tempering/      # installable package
 ├── targets.py                 # GMMTarget
 ├── resampling.py              # systematic resampling + ESS
 ├── mala.py                    # isotropic MALA (standalone; not used by the notebooks)
-├── mala_kernel.py             # PTProblem + covariance-preconditioned HMC kernel
+├── mala_kernel.py             # PTProblem + covariance-preconditioned HMC kernel (full refresh)
+├── hmc_kernel.py              # the same kernel with partial refresh (used by GMM16, GMM50, DW4)
 ├── smc.py                     # adaptive-temperature SMC (ladder construction)
 ├── rejuvenate.py              # HMC rejuvenation with the SMC-adapted kernel
 ├── sampler.py                 # backward SDE + path-space log-weights

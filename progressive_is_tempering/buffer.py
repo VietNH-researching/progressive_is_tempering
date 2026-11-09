@@ -10,6 +10,11 @@ Design choices:
 - Python-level state (ptr, size are ints), JAX arrays for data & log_weights.
 - FIFO eviction via a circular write pointer.
 - Systematic resampling (see resampling.py) for weighted sampling.
+- Optionally (`store_grads=True`) each row also holds ∇E(x), written once when
+  the row is added, so the TSM loss reads it instead of recomputing it at every
+  inner step. The two are stored side by side as one `[x | ∇E(x)]` array, so a
+  mini-batch is still a single gather (the inner loop issues one per level per
+  step, and on small targets those eager dispatches dominate its run time).
 """
 
 from __future__ import annotations
@@ -33,13 +38,18 @@ class ReplayBuffer:
         Maximum number of (sample, log_weight) pairs stored.
     dim : int
         Sample dimension.
+    store_grads : bool
+        Also store ∇E(x) per row: `add` then requires `grads`, and
+        `sample_with_grads` returns the rows as `[x | ∇E(x)]`.
     """
 
-    def __init__(self, capacity: int, dim: int) -> None:
+    def __init__(self, capacity: int, dim: int, store_grads: bool = False) -> None:
         self.capacity = capacity
         self.dim = dim
-        # Data and log-weight storage (preallocated, zero-initialized)
-        self.data = jnp.zeros((capacity, dim), dtype=jnp.float32)
+        self.store_grads = store_grads
+        # Row storage, preallocated and zero-initialized: x, or [x | ∇E(x)]
+        self.rows = jnp.zeros((capacity, 2 * dim if store_grads else dim),
+                              dtype=jnp.float32)
         # -inf marks slots that have never been written (skipped in sampling)
         self.log_weights = jnp.full((capacity,), -jnp.inf, dtype=jnp.float32)
         self.size: int = 0  # number of valid entries (≤ capacity)
@@ -49,7 +59,19 @@ class ReplayBuffer:
     # Mutation helpers
     # ------------------------------------------------------------------
 
-    def add(self, samples: Array, log_weights: Array) -> None:
+    @property
+    def data(self) -> Array:
+        """Stored samples, shape (capacity, dim)."""
+        return self.rows[:, : self.dim] if self.store_grads else self.rows
+
+    @property
+    def grads(self) -> Array:
+        """Stored ∇E(x), shape (capacity, dim). Requires `store_grads`."""
+        if not self.store_grads:
+            raise AttributeError("this buffer was created with store_grads=False")
+        return self.rows[:, self.dim :]
+
+    def add(self, samples: Array, log_weights: Array, grads: Array | None = None) -> None:
         """
         Append samples to the buffer with FIFO eviction.
 
@@ -57,10 +79,17 @@ class ReplayBuffer:
         ----------
         samples : Array, shape (n, dim)
         log_weights : Array, shape (n,)
+        grads : Array, shape (n, dim), optional
+            ∇E at each sample. Required if and only if `store_grads`.
         """
+        if self.store_grads != (grads is not None):
+            raise ValueError(
+                "grads must be given if and only if the buffer has store_grads=True"
+            )
         n = samples.shape[0]
         indices = (jnp.arange(n) + self.ptr) % self.capacity
-        self.data = self.data.at[indices].set(samples)
+        block = jnp.concatenate([samples, grads], axis=1) if self.store_grads else samples
+        self.rows = self.rows.at[indices].set(block)
         self.log_weights = self.log_weights.at[indices].set(log_weights)
         self.ptr = int((self.ptr + n) % self.capacity)
         self.size = min(self.size + n, self.capacity)
@@ -95,7 +124,26 @@ class ReplayBuffer:
         """
         valid_lw = self.log_weights[: self.size]
         indices = systematic_resample(key, valid_lw, batch_size)
-        return self.data[indices], self.log_weights[indices]
+        if self.store_grads:
+            return self.rows[indices][:, : self.dim], self.log_weights[indices]
+        return self.rows[indices], self.log_weights[indices]
+
+    def sample_with_grads(self, key: Array, batch_size: int) -> tuple[Array, Array]:
+        """
+        As `sample` (same key, same draws), but returns each row as
+        `[x | ∇E(x)]` in one array: one gather for both. Requires `store_grads`.
+
+        Returns
+        -------
+        rows : Array, shape (batch_size, 2 * dim)
+            `rows[:, :dim]` are the samples, `rows[:, dim:]` their ∇E.
+        log_weights_sampled : Array, shape (batch_size,)
+        """
+        if not self.store_grads:
+            raise ValueError("sample_with_grads needs a buffer with store_grads=True")
+        valid_lw = self.log_weights[: self.size]
+        indices = systematic_resample(key, valid_lw, batch_size)
+        return self.rows[indices], self.log_weights[indices]
 
     def is_ready(self, min_size: int) -> bool:
         """Return True if the buffer holds at least min_size valid entries."""

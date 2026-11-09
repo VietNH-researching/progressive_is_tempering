@@ -203,3 +203,51 @@ class TestRejuvenateProjected:
         assert acc.shape == (n_rungs,)
         com = new_p.reshape(n_rungs, 12, n_particles, spatial_dim).mean(axis=2)
         assert jnp.abs(com).max() < 1e-4
+
+
+class TestRejuvenateEnergyAndInvariance:
+    """`return_energy` reads E from the final particle; `project_invariant`
+    skips re-evaluating an energy that the projection cannot change."""
+
+    def test_return_energy_matches_energy_and_positions(self):
+        key = jax.random.PRNGKey(20)
+        problem = _gaussian_problem(4)
+        particles = jax.random.normal(key, (30, 4))
+        params = _calibrated_params(problem, 0.7, 2, particles, key)
+        p2, a2 = rejuvenate(key, particles, problem, jnp.array(0.7), 2, params, 8)
+        p3, a3, e3 = rejuvenate(key, particles, problem, jnp.array(0.7), 2, params, 8,
+                                return_energy=True)
+        assert jnp.array_equal(p2, p3)
+        assert jnp.array_equal(a2, a3)
+        expected = -jax.vmap(problem.logpdf_final_target)(p3)
+        assert jnp.allclose(e3, expected, rtol=1e-6, atol=1e-5)
+
+    def test_project_invariant_matches_full_reinit(self):
+        """For an energy that depends on pair distances only, skipping the
+        energy re-evaluation after the zero-CoM projection must give the same
+        chain as re-deriving everything."""
+        n_particles, spatial_dim = 3, 2
+        dim = n_particles * spatial_dim
+
+        def energy(x):  # pair distances only: translation invariant
+            xr = x.reshape(n_particles, spatial_dim)
+            d2 = jnp.sum((xr[:, None] - xr[None]) ** 2, axis=-1)
+            return 0.5 * jnp.sum(d2) / n_particles
+
+        project_fn = lambda x: _project_com(x, n_particles, spatial_dim)
+        problem = PTProblem(
+            rvs_ref=lambda k: project_fn(jax.random.normal(k, (dim,))),
+            logpdf_ref=lambda x: -0.5 * jnp.sum(x ** 2),
+            logpdf_final_target=lambda x: -energy(x),
+        )
+        key = jax.random.PRNGKey(21)
+        particles = jax.vmap(project_fn)(jax.random.normal(key, (64, dim)))
+        params = _calibrated_params(problem, 0.6, 3, particles, key)
+        full = rejuvenate(key, particles, problem, jnp.array(0.6), 3, params, 10,
+                          project_fn=project_fn, return_energy=True)
+        cut = rejuvenate(key, particles, problem, jnp.array(0.6), 3, params, 10,
+                         project_fn=project_fn, project_invariant=True,
+                         return_energy=True)
+        assert jnp.allclose(full[0], cut[0], atol=1e-5)
+        assert jnp.allclose(full[2], cut[2], rtol=1e-5, atol=1e-5)
+        assert jnp.allclose(cut[2], jax.vmap(energy)(cut[0]), rtol=1e-5, atol=1e-5)

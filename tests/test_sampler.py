@@ -5,6 +5,8 @@ Tests cover:
   - backward_sde_step: output shapes, log-weight formula.
   - backward_sde_single: shape, finite log-weight, weight = 0 for exact score.
   - backward_sde_batch: batched shapes.
+  - exponential_time_grid / t_end: grid shape and endpoints; with zero control
+    at β=0 the exact path weight is 0 on the exponential grid too.
   - JIT / vmap compatibility.
 
 The "exact score" test uses the reference target (β=0, π_β = N(0,I)) where
@@ -20,6 +22,8 @@ from progressive_is_tempering.sampler import (
     backward_sde_batch,
     backward_sde_single,
     backward_sde_step,
+    exponential_time_grid,
+    power_time_grid,
 )
 
 
@@ -149,3 +153,64 @@ class TestBackwardSDEBatch:
             dim=4, n_particles=10, T=1.0, n_steps=10
         )
         assert jnp.all(jnp.isfinite(lw))
+
+class TestExponentialGrid:
+    def test_grid_shape_and_endpoints(self):
+        times, dts = exponential_time_grid(4.0, 100, 1e-3)
+        assert times.shape == dts.shape == (100,)
+        assert float(times[0]) == pytest.approx(4.0)
+        assert float(times[-1]) == pytest.approx(1e-3)
+        assert float(dts[-1]) == pytest.approx(1e-3)        # last step: t_1 -> 0
+        assert float(jnp.sum(dts)) == pytest.approx(4.0, rel=1e-5)
+        assert bool(jnp.all(jnp.diff(times) < 0))           # decreasing
+        # Steps shrink geometrically down to t_1; the final step t_1 -> 0 is t_end
+        # itself, larger than the one before it (t_2 - t_1).
+        assert bool(jnp.all(jnp.diff(dts[:-1]) < 0))
+
+    def test_invalid_arguments(self):
+        with pytest.raises(ValueError):
+            exponential_time_grid(4.0, 1, 1e-3)
+        with pytest.raises(ValueError):
+            exponential_time_grid(4.0, 10, 5.0)
+
+    def test_zero_control_reference_weight_is_zero(self):
+        """β=0, u=0: the proposal is the stationary reference path itself, so
+        the log-weight is 0 for every particle (up to float32 rounding)."""
+        _, lw = backward_sde_batch(
+            jax.random.PRNGKey(4), zero_control, jnp.array(0.0), gaussian_energy,
+            dim=8, n_particles=64, T=4.0, n_steps=100, t_end=1e-3,
+        )
+        assert float(jnp.max(jnp.abs(lw))) < 1e-3
+
+    def test_uniform_default_unchanged(self):
+        key = jax.random.PRNGKey(5)
+        a = backward_sde_batch(key, zero_control, jnp.array(0.5), gaussian_energy,
+                               dim=3, n_particles=8, T=2.0, n_steps=20)
+        b = backward_sde_batch(key, zero_control, jnp.array(0.5), gaussian_energy,
+                               dim=3, n_particles=8, T=2.0, n_steps=20, t_end=None)
+        assert jnp.array_equal(a[0], b[0]) and jnp.array_equal(a[1], b[1])
+
+
+class TestPowerGrid:
+    def test_grid_shape_and_endpoints(self):
+        times, dts = power_time_grid(1.5, 55, 2.0)
+        assert times.shape == dts.shape == (55,)
+        assert float(times[0]) == pytest.approx(1.5)
+        assert float(times[-1]) == pytest.approx(1.5 / 55 ** 2)
+        assert float(dts[-1]) == pytest.approx(1.5 / 55 ** 2)   # last step: t_1 -> 0
+        assert float(jnp.sum(dts)) == pytest.approx(1.5, rel=1e-5)
+        assert bool(jnp.all(jnp.diff(times) < 0))
+        assert bool(jnp.all(jnp.diff(dts) < 0))                 # steps shrink towards 0
+
+    def test_power_one_is_uniform(self):
+        times, dts = power_time_grid(2.0, 20, 1.0)
+        assert jnp.allclose(dts, 0.1, atol=1e-6)
+        assert jnp.allclose(times, jnp.linspace(2.0, 0.1, 20), atol=1e-6)
+
+    def test_invalid_arguments(self):
+        with pytest.raises(ValueError):
+            power_time_grid(1.5, 0, 2.0)
+        with pytest.raises(ValueError):
+            power_time_grid(0.0, 10, 2.0)
+        with pytest.raises(ValueError):
+            power_time_grid(1.5, 10, 0.5)

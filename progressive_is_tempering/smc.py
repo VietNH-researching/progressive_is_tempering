@@ -7,8 +7,8 @@ along the geometric path. Each step:
 1. bisects for the next temperature at which reweighting drops the
    normalized ESS to `local_ess_ratio`;
 2. reweights and systematically resamples;
-3. adapts the HMC kernel (`mala_kernel`) at the new rung and runs
-   `n_mcmc_steps` moves;
+3. adapts the HMC kernel (`mala_kernel`, or `hmc_kernel` with
+   ``kernel="hmc"``) at the new rung and runs `n_mcmc_steps` moves;
 4. estimates the local log normalizing-constant ratio with three estimators.
 
 `smc_sampler` returns the particle block at every rung, the ladder, the
@@ -38,8 +38,13 @@ from progressive_is_tempering.mala_kernel import (
     mala_kernel,
     repeated_batch_move,
 )
+from progressive_is_tempering.hmc_kernel import hmc_kernel
 
-__all__ = ["smc_sampler", "one_step_smc"]
+__all__ = ["smc_sampler", "one_step_smc", "KERNELS"]
+
+# Kernel factories selectable by name: "mala" = full refresh (the original
+# kernel), "hmc" = partial refresh. Both share the particle and parameter types.
+KERNELS = {"mala": mala_kernel, "hmc": hmc_kernel}
 
 _LOGZ_ESTIMATORS = ("SMC_like", "robust", "reverse_logistic")
 
@@ -267,7 +272,7 @@ class OneStepSMCResult(NamedTuple):
 
 
 def one_step_smc(key, x: MALAParticle, problem: PTProblem, niter_mcmc: int,
-                 new_ess_ratio: float = 0.5) -> OneStepSMCResult:
+                 new_ess_ratio: float = 0.5, kernel: str = "mala") -> OneStepSMCResult:
     """
     One SMC annealing step: next temperature, reweight + resample, adapt the
     HMC kernel at the new rung, run `niter_mcmc` moves, estimate local log Z.
@@ -283,7 +288,7 @@ def one_step_smc(key, x: MALAParticle, problem: PTProblem, niter_mcmc: int,
     x_next = _pytree_index(x, idx)
 
     # Change temperature
-    kernel = mala_kernel(problem, t_next, x.temperature_idx[0] + 1)
+    kernel = KERNELS[kernel](problem, t_next, x.temperature_idx[0] + 1)
     x_next = batch_reset_temperature(x_next, kernel)
 
     # Move with adapted parameters
@@ -322,7 +327,7 @@ def _validate_open_unit_interval(name: str, value):
 
 
 def smc_sampler(key, problem: PTProblem, n_particles: int, n_mcmc_steps: int,
-                local_ess_ratio: float, verbose: bool = True):
+                local_ess_ratio: float, verbose: bool = True, kernel: str = "mala"):
     """
     Anneal from t=0 to t=1 with an adaptive temperature ladder.
 
@@ -340,6 +345,10 @@ def smc_sampler(key, problem: PTProblem, n_particles: int, n_mcmc_steps: int,
     verbose : bool
         Print one line per rung (temperature, acceptance, local and cumulative
         log Z by each estimator).
+    kernel : {"mala", "hmc"}
+        MCMC kernel adapted and run at every rung: "mala" (full refresh,
+        `mala_kernel`) or "hmc" (partial refresh, `hmc_kernel`). Pass the same
+        value to `rejuvenate`, which reuses the adapted parameters.
 
     Returns
     -------
@@ -356,6 +365,8 @@ def smc_sampler(key, problem: PTProblem, n_particles: int, n_mcmc_steps: int,
     n_particles = _validate_int_count('n_particles', n_particles, 1)
     n_mcmc_steps = _validate_int_count('n_mcmc_steps', n_mcmc_steps, 0)
     local_ess_ratio = _validate_open_unit_interval('local_ess_ratio', local_ess_ratio)
+    if kernel not in KERNELS:
+        raise ValueError(f"kernel must be one of {tuple(KERNELS)} (got {kernel!r})")
 
     # Initialize and compile
     if verbose:
@@ -369,7 +380,7 @@ def smc_sampler(key, problem: PTProblem, n_particles: int, n_mcmc_steps: int,
     x = block_until_ready(x)
 
     mover = jit(partial(one_step_smc, problem=problem, niter_mcmc=n_mcmc_steps,
-                        new_ess_ratio=local_ess_ratio))
+                        new_ess_ratio=local_ess_ratio, kernel=kernel))
 
     # Run
     logZ_ret = defaultdict(float)   # cumulative log(Z_t / Z_0) per estimator

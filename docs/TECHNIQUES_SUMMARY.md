@@ -236,16 +236,42 @@ score is exactly right would then produce non-zero path weights — discretizati
 bias that cannot be told apart from score error. The exponential kernel leaves
 $\rho$ exactly invariant at every $\Delta t$.
 
-**Time grid and where the network is queried.** In code the grid is
-`linspace(T, Δt, N)`: the network is evaluated once per step, at
-$t_n\in\{T,\,T-\Delta t,\,\ldots,\,\Delta t\}$, and **never at $t=0$** — the final
-step from $t_1=\Delta t$ to $t_0=0$ uses $u_\theta(x_1,\Delta t,\beta)$. Training
-draws $t\sim\mathrm{Unif}[t_{\min},T]$, so a grid with $\Delta t<t_{\min}$ queries
-the network at roughly $t_{\min}/\Delta t$ noise times it never trained on
-(about five steps for $\Delta t=0.002$, $t_{\min}=0.01$). The damage is bounded — such a
-step moves $x$ by only $(1-\lambda)\,u_\theta\approx\Delta t\,u_\theta$ — but it
-disappears entirely if $t_{\min}$ is set at or below the finest $\Delta t$ the
-sampler will be run with.
+**Time grid and where the network is queried.** The step above holds on any
+grid $0=t_0<t_1<\dots<t_N=T$, with each step using its own
+$\Delta t_n=t_n-t_{n-1}$ in $\lambda$ and $\sigma^2$; the weights below stay exact.
+The network is evaluated once per step, at $t_N,\dots,t_1$, and **never at
+$t=0$** — the final step from $t_1$ to $t_0=0$ uses $u_\theta(x_1,t_1,\beta)$.
+
+- *Uniform* (`backward_sde_batch` default): $t_n=n\,T/N$. Training draws
+  $t\sim\mathrm{Unif}[t_{\min},T]$, so a grid with $\Delta t<t_{\min}$ queries the
+  network at roughly $t_{\min}/\Delta t$ noise times it never trained on.
+- *Exponential* (`t_end=` argument, `exponential_time_grid`; used by the GMM16,
+  GMM50 and DW4 notebooks): $t_n=t_{\min}(T/t_{\min})^{(n-1)/(N-1)}$ for $n=1,\dots,N$, so
+  steps shrink geometrically towards $t=0$, the last one is exactly
+  $t_1=t_{\min}$, and the network is never queried below $t_{\min}$.
+- *Power* (`power_time_grid`; used by the LJ13 notebook): $t_n=T\,(n/N)^2$, so the
+  steps shrink quadratically towards $t=0$. With $T=1.5$ the last step is
+  $5\times10^{-4}$ at $N=55$ (training) and $4\times10^{-7}$ at $N=2000$
+  (evaluation), where the network is queried below $t_{\min}=10^{-4}$. To put the
+  training effort where these last steps are, LJ13 draws
+  $t=t_{\min}+(T-t_{\min})\,u^4$, $u\sim\mathrm{Unif}[0,1]$, instead of a uniform $t$.
+
+The terminal step matters most: it adds noise of scale
+$\sigma_1=\sqrt{1-e^{-2\Delta t_1}}$ to the returned $x_0$ that no control can
+remove. With $N=100$ a uniform grid on $T=4$ ends with $\Delta t_1=0.04$
+($\sigma_1\approx0.28$); the exponential grid with $t_{\min}=10^{-3}$ ends with
+$\sigma_1\approx0.045$. On GMM16, GMM50 and DW4 this improved the samples and the
+path ESS at the same step count.
+
+**Choosing $T$.** The sampler starts from $\mathcal N(0,I)$, not from the noised
+target $p_T$, so even an exact score leaves each path the weight
+$p_T(x_T)/\mathcal N(x_T;0,I)$, capping the path ESS at
+$1/\mathbb E_{\mathcal N}[(p_T/\mathcal N)^2]$ (at $\beta=1$). The cap depends on how
+far the target is from $\mathcal N(0,I)$: about $0.985$ at $T=4$ for GMM16 (every
+coordinate is off-centre, and the mismatch compounds over 16 dimensions;
+$0.41$ at $T=2$), $0.953$ at $T=4$ for GMM50 ($0.88$ at $T=3.5$), and $0.986$ at $T=2$ for DW4 ($0.54$ at $T=1$). Pick the
+smallest $T$ whose cap is close to 1; a shorter horizon gives the same step
+count a finer grid.
 
 ### Path-space importance weights
 
@@ -373,9 +399,14 @@ match $\{\beta_k\}$. These are the only samples available before training that
 are actually distributed as $\pi_{\beta_k}$.
 
 The MCMC kernel parameters SMC adapted *at* each rung. The kernel is HMC with a
-single leapfrog step and full velocity refresh, whose preconditioner is the Cholesky factor of the empirical covariance of that
-rung's population and whose step size $\varepsilon$ is bisected to land the
-acceptance rate in $[0.4,0.65]$.
+single leapfrog step, whose preconditioner is the Cholesky factor of the empirical covariance of that
+rung's population. All four notebooks use partial velocity refresh
+(`hmc_kernel`): after each move the velocity becomes
+$v \leftarrow -\sqrt{1-\rho}\,v + \sqrt{\rho}\,z$ with $\rho = 0.07$ and
+$z\sim\mathcal{N}(0,I)$, so momentum persists across moves, and the step size
+$\varepsilon$ is bisected to land the acceptance rate in $[0.8,0.95]$. Full refresh
+($\rho = 1$, `mala_kernel`, the package default) gives one preconditioned Langevin
+step per move, with acceptance in $[0.4,0.65]$.
 
 This kernel is reused verbatim for outer-loop rejuvenation in Phase 2, and
 nothing is recalibrated afterwards: it was adapted on a population actually
@@ -633,7 +664,7 @@ Three properties are worth naming:
 
 1. Draw $B$ samples from buffer $k$ by systematic resampling on its stored IS
    weights.
-2. Draw noise times $t_i\sim\mathrm{Unif}[t_{\min},T]$ and noise each sample
+2. Draw noise times $t_i\sim\mathrm{Unif}[t_{\min},T]$ (LJ13: $t_i=t_{\min}+(T-t_{\min})u_i^4$) and noise each sample
    through the forward OU kernel,
    $x_{t,i}\sim\mathcal{N}(e^{-t_i}x_{0,i},\sigma_{t_i}^2I)$.
 3. Form the targets $\phi_i=\lambda_{t_i}\beta_k(x_{0,i}-\nabla E(x_{0,i}))$
