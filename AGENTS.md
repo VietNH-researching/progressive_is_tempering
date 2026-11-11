@@ -48,8 +48,8 @@ cd notebooks/gmm && for s in 0 1 2; do RUN_SEED=$s python gmm.py; done
 A single notebook run with `RUN_SEED=N` set writes to `results/<target>/seedN/`;
 without it, to `results/<target>/`.
 
-The DW4 and LJ13 notebooks read `data/test_split_DW4.npy` and
-`data/test_split_LJ13-1000.npy`, which are not tracked; fetch them with
+The DW4, LJ13 and LJ55 notebooks read `data/test_split_DW4.npy`,
+`data/test_split_LJ13-1000.npy` and `data/test_split_LJ55-1000-part1.npy`, which are not tracked; fetch them with
 `bash data/redownload.sh`.
 
 The package is installed editable and imported as `progressive_is_tempering`; there are
@@ -92,6 +92,7 @@ progressive_is_tempering/          # repo root
 │   ├── gmm50/                     # GMM at 50-D (gmm50.py + gmm50.ipynb)
 │   ├── dw4/                       # DW4 molecule experiment (dw4.py + dw4.ipynb)
 │   ├── lj13/                      # LJ13 cluster experiment (lj13.py + lj13.ipynb)
+│   ├── lj55/                      # LJ55 cluster experiment (lj55.py + lj55.ipynb)
 │   └── templates/minimal.py       # minimal training loop template
 ├── tests/                         # pytest suite
 │   ├── test_sde.py
@@ -165,9 +166,9 @@ from higher layers.
 
 **Outer loop** (one iteration = one data-generation pass)
 
-All `M_active = M - 1` active levels (`k = 1 … M-1`) are processed in parallel inside a single `jax.vmap` call (`_data_gen_parallel`, inner function `process_one`):
+All `M_active = M - 1` active levels (`k = 1 … M-1`) are processed in parallel inside a single `jax.vmap` call (`_data_gen_parallel`, inner function `process_one`; LJ55 runs the same `process_one` rung by rung with `jax.lax.map` in `_data_gen`, for memory):
 
-1. Backward SDE at `β_k` → `(x0_batch, log_w_path)` — K particles with path-space log-weights. GMM uses `sampler.backward_sde_batch`; DW4 / LJ13 use the notebook's `backward_sde_batch_com`, which projects to zero CoM after every step and calls the EGNN once per step on the whole batch. GMM16, GMM50 and DW4 run it on the exponential time grid (`t_end = t_min`); LJ13 on the power grid `t_n = T (n/N)²` (`sampler.power_time_grid`, T = 1.5, N = 55 train / 2000 eval). See `docs/TECHNIQUES_SUMMARY.md`.
+1. Backward SDE at `β_k` → `(x0_batch, log_w_path)` — K particles with path-space log-weights. GMM uses `sampler.backward_sde_batch`; DW4 / LJ13 / LJ55 use the notebook's `backward_sde_batch_com`, which projects to zero CoM after every step and calls the EGNN once per step on the whole batch (LJ55: in chunks of `net_chunk` states). GMM16, GMM50 and DW4 run it on the exponential time grid (`t_end = t_min`), LJ55 too (T = 1.5, `t_min = 1e-5`, N = 80 train / 1000 eval, network time input `log(t/t_min)/log(T/t_min)`); LJ13 on the power grid `t_n = T (n/N)²` (`sampler.power_time_grid`, T = 1.5, N = 55 train / 2000 eval). See `docs/TECHNIQUES_SUMMARY.md`.
 2. `systematic_resample(key, log_w_path, K)` → approximately i.i.d. draws from `π_{β_k}`.
 3. `rejuvenate(key, particles, pt_problem, β_k, k, mcmc_params_k, n_mala_rejuv[, project_fn, project_invariant, return_energy])` → diversified particles, acceptance rate (and, with `return_energy=True`, `E(x)` read from the final HMC state at no extra cost).
 4. IS log-weights to the next level, `(β_{k+1} − β_k)(−E(x) + ½‖x‖²)` (inlined in `process_one`; same formula as `ReplayBuffer.is_bridge_log_weights`). Every notebook takes `E(x)` from step 3.
@@ -180,8 +181,8 @@ After `jax.vmap` returns, buffer writes are sequential Python mutations: `buffer
 For each of `n_inner_steps`:
 
 1. For every level `k`, draw a mini-batch from `buffer[k]` via `systematic_resample` on IS log-weights (`sample_with_grads`: rows `[x_0 | ∇E(x_0)]` in one gather).
-2. Sample `t ~ Unif[t_min, T]` (LJ13: `t = t_min + (T − t_min) u⁴`, `u ~ Unif[0, 1]`, concentrated near `t_min = 1e-4`); apply OU forward noising `x_t = e^{-t} x_0 + σ_t ε`.
-3. Compute TSM targets `φ = e^{-t} β (x_0 - ∇E(x_0))` under `stop_gradient` (read `∇E(x_0)` from the buffer row; buffer 0 stores zeros, since `φ = 0` at `β = 0`).
+2. Sample `t ~ Unif[t_min, T]` (LJ13: `t = t_min + (T − t_min) u⁴`, `u ~ Unif[0, 1]`, concentrated near `t_min = 1e-4`; LJ55: log-uniform on `[t_min, T]`); apply OU forward noising `x_t = e^{-t} x_0 + σ_t ε`.
+3. Compute TSM targets `φ = e^{-t} β (x_0 - ∇E(x_0))` under `stop_gradient` (read `∇E(x_0)` from the buffer row; buffer 0 stores zeros, since `φ = 0` at `β = 0`). LJ13 and LJ55 clip `φ` per particle (LJ55: per rung, at the 99.9% quantile on the rung's SMC seed), and LJ55 drops rows with non-finite or too large `β∇E` (log-weight `-inf`).
 4. Concatenate all `(M+1) * B` triples across temperatures; one Adam step with global-norm gradient clipping.
 
 **Evaluation / Sampling** (after training)
@@ -240,11 +241,11 @@ Run the backward SDE at `β=1` with `n_sde_steps_eval >> n_sde_steps_train` (e.g
 
 **HMC particle gradient fields are NaN outside a jump's midpoint** — the kernel evaluates `∇log π` only where the leapfrog reads it (after the first half position step). `init_extend`, the jump endpoint, and therefore every particle a move returns carry log-density *values* only, with `gradlogpdf_*` filled with NaN as a tripwire. Do not read those fields from a returned particle; compute the gradient yourself if you need it.
 
-**`project_invariant=True` only for projection-invariant energies** — it tells `rejuvenate` that `logpdf_final_target` is unchanged by `project_fn`, so the re-projection after each move skips re-evaluating it. True for DW4 (pair distances, `trap_scale=0`); false for LJ13, whose harmonic trap depends on the CoM.
+**`project_invariant=True` only for projection-invariant energies** — it tells `rejuvenate` that `logpdf_final_target` is unchanged by `project_fn`, so the re-projection after each move skips re-evaluating it. True for DW4 (pair distances, `trap_scale=0`); false for LJ13 and LJ55, whose harmonic trap depends on the CoM.
 
-**Reproducibility needs deterministic GPU ops** — every notebook (GMM16, GMM50, DW4, LJ13) sets `--xla_gpu_deterministic_ops=true` in `XLA_FLAGS` before importing JAX. Without it the same seed gives different results in different processes: XLA's GPU reductions and scatters may sum in a different order, and SMC's adaptive ladder turns last-bit differences into a different ladder. With it, a seed reproduces the committed `results/{gmm,gmm50,dw4}/seedN/*/metrics.json` exactly on the same hardware and software (produced on NVIDIA RTX 4500 Ada GPUs with JAX 0.9.0.1, whichever GPU index and with or without `scripts/run_seeds.sh`); other GPU models or JAX/CUDA versions may still differ in the last bits. LJ13's `results/lj13/seedN/` were produced with the flag, but a rerun has not yet confirmed them bit for bit.
+**Reproducibility needs deterministic GPU ops** — every notebook (GMM16, GMM50, DW4, LJ13, LJ55) sets `--xla_gpu_deterministic_ops=true` in `XLA_FLAGS` before importing JAX. Without it the same seed gives different results in different processes: XLA's GPU reductions and scatters may sum in a different order, and SMC's adaptive ladder turns last-bit differences into a different ladder. With it, a seed reproduces the committed `results/{gmm,gmm50,dw4}/seedN/*/metrics.json` exactly on the same hardware and software (produced on NVIDIA RTX 4500 Ada GPUs with JAX 0.9.0.1, whichever GPU index and with or without `scripts/run_seeds.sh`); other GPU models or JAX/CUDA versions may still differ in the last bits. LJ13's `results/lj13/seedN/` were produced with the flag, but a rerun has not yet confirmed them bit for bit. LJ55's `results/lj55/seedN/` were produced with the flag by the study script `notebooks/lj55/lj55.py` was ported from (same numerics and key order; checked against it on CPU), not by the notebook itself, and have not been rerun.
 
-**Two kernels, selected by name** — `smc_sampler(..., kernel=...)` and `rejuvenate(..., kernel=...)` take `"hmc"` (`hmc_kernel`: one leapfrog step, partial velocity refresh 0.07 so momentum persists across moves, acceptance `[0.8, 0.95]`) or `"mala"` (`mala_kernel`: the same step with full refresh, acceptance `[0.4, 0.65]`; the package default). All four notebooks set `mcmc_kernel = "hmc"` in their training config. Pass `rejuvenate` the same `kernel` SMC ran with: the adapted `MALAParameters` carry that kernel's refresh rate and step size. `hmc_kernel` differs from `mala_kernel` only in `adapt_params` (its `move` is `mala_kernel`'s), and with `project_fn` set, `rejuvenate` carries the velocity across each re-projection for `"hmc"` instead of redrawing it.
+**Two kernels, selected by name** — `smc_sampler(..., kernel=...)` and `rejuvenate(..., kernel=...)` take `"hmc"` (`hmc_kernel`: one leapfrog step, partial velocity refresh 0.07 so momentum persists across moves, acceptance `[0.8, 0.95]`) or `"mala"` (`mala_kernel`: the same step with full refresh, acceptance `[0.4, 0.65]`; the package default). All five notebooks set `mcmc_kernel = "hmc"` in their training config. Pass `rejuvenate` the same `kernel` SMC ran with: the adapted `MALAParameters` carry that kernel's refresh rate and step size. `hmc_kernel` differs from `mala_kernel` only in `adapt_params` (its `move` is `mala_kernel`'s), and with `project_fn` set, `rejuvenate` carries the velocity across each re-projection for `"hmc"` instead of redrawing it.
 
 **`smc.py` / `mala_kernel.py` / `hmc_kernel.py` are order-sensitive** — keep arithmetic expression order, key splits, and `lax.cond` structure as they are when editing. Seemingly equivalent rewrites (merging the two half velocity steps, dropping the `t_idx == 0` branch in `move`, reusing `resampling.systematic_resample` in SMC) change the floating-point results or the random stream, so the same seed gives different results.
 

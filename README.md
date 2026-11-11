@@ -35,14 +35,14 @@ python -c "import progressive_is_tempering"
 ```
 
 **Dependencies installed automatically:** JAX, Flax, Optax, SciPy and POT. All
-target energies (GMM, DW4, LJ13) are implemented in `progressive_is_tempering/targets.py`.
+target energies (GMM, DW4, LJ13, LJ55) are implemented in `progressive_is_tempering/targets.py`.
 Install the JAX build that matches your accelerator (see the [JAX installation guide](https://docs.jax.dev/en/latest/installation.html)).
 
 ---
 
 ## Experiments
 
-Four experiments live under `notebooks/`, one self-contained notebook per target:
+Five experiments live under `notebooks/`, one self-contained notebook per target:
 
 | Experiment | Target | Score network | Notebook |
 |---|---|---|---|
@@ -50,10 +50,11 @@ Four experiments live under `notebooks/`, one self-contained notebook per target
 | GMM50 | the same mixture at 50-D | ResMLP | `notebooks/gmm50/gmm50.ipynb` |
 | DW4 | 4-particle double-well molecule | Equivariant EGNN | `notebooks/dw4/dw4.ipynb` |
 | LJ13 | 13-atom Lennard-Jones cluster | Equivariant EGNN | `notebooks/lj13/lj13.ipynb` |
+| LJ55 | 55-atom Lennard-Jones cluster | Equivariant EGNN | `notebooks/lj55/lj55.ipynb` |
 
 Each notebook has a matching `.py` script (Jupytext percent format), which is the canonical source. Hyperparameters live in the `ModelConfig` and `TrainingConfig` dataclasses near the top of each script.
 
-**Reference data.** DW4 and LJ13 are evaluated against the standard test splits from the DEM benchmark. Neither split is tracked; fetch them before running those notebooks:
+**Reference data.** DW4, LJ13 and LJ55 are evaluated against the standard test splits from the DEM benchmark. None of the splits is tracked; fetch them before running those notebooks:
 
 ```bash
 bash data/redownload.sh
@@ -76,9 +77,9 @@ cd notebooks/gmm
 for s in 0 1 2; do RUN_SEED=$s python gmm.py; done
 ```
 
-The reported results use seeds 0, 1 and 2 of every target, run in turn by `scripts/run_seeds.sh`.
+The reported results use seeds 0, 1 and 2 of every target, run in turn by `scripts/run_seeds.sh` (LJ55's with the same settings by the study script its notebook was ported from; about 16 h of GPU time per seed).
 
-**Reproducibility.** All four scripts (GMM16, GMM50, DW4, LJ13) turn on deterministic GPU kernels (`--xla_gpu_deterministic_ops=true`), so `RUN_SEED=0`, `1` or `2` reproduces the committed `results/{gmm,gmm50,dw4}/seedN/*/metrics.json` exactly — on the same GPU model and software versions (NVIDIA RTX 4500 Ada, JAX 0.9.0.1). Other GPUs or JAX/CUDA versions can differ in the last bits, which SMC's adaptive temperature ladder amplifies into visibly different numbers.
+**Reproducibility.** All five scripts (GMM16, GMM50, DW4, LJ13, LJ55) turn on deterministic GPU kernels (`--xla_gpu_deterministic_ops=true`), so `RUN_SEED=0`, `1` or `2` reproduces the committed `results/{gmm,gmm50,dw4}/seedN/*/metrics.json` exactly — on the same GPU model and software versions (NVIDIA RTX 4500 Ada, JAX 0.9.0.1). Other GPUs or JAX/CUDA versions can differ in the last bits, which SMC's adaptive temperature ladder amplifies into visibly different numbers.
 
 ---
 
@@ -100,7 +101,7 @@ progressive_is_tempering/      # installable package
 ├── resampling.py              # systematic resampling + ESS
 ├── mala.py                    # isotropic MALA (standalone; not used by the notebooks)
 ├── mala_kernel.py             # PTProblem + covariance-preconditioned HMC kernel (full refresh)
-├── hmc_kernel.py              # the same kernel with partial refresh (used by GMM16, GMM50, DW4)
+├── hmc_kernel.py              # the same kernel with partial refresh (used by every notebook)
 ├── smc.py                     # adaptive-temperature SMC (ladder construction)
 ├── rejuvenate.py              # HMC rejuvenation with the SMC-adapted kernel
 ├── sampler.py                 # backward SDE + path-space log-weights

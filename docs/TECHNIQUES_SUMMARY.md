@@ -246,7 +246,7 @@ $t=0$** — the final step from $t_1$ to $t_0=0$ uses $u_\theta(x_1,t_1,\beta)$.
   $t\sim\mathrm{Unif}[t_{\min},T]$, so a grid with $\Delta t<t_{\min}$ queries the
   network at roughly $t_{\min}/\Delta t$ noise times it never trained on.
 - *Exponential* (`t_end=` argument, `exponential_time_grid`; used by the GMM16,
-  GMM50 and DW4 notebooks): $t_n=t_{\min}(T/t_{\min})^{(n-1)/(N-1)}$ for $n=1,\dots,N$, so
+  GMM50, DW4 and LJ55 notebooks): $t_n=t_{\min}(T/t_{\min})^{(n-1)/(N-1)}$ for $n=1,\dots,N$, so
   steps shrink geometrically towards $t=0$, the last one is exactly
   $t_1=t_{\min}$, and the network is never queried below $t_{\min}$.
 - *Power* (`power_time_grid`; used by the LJ13 notebook): $t_n=T\,(n/N)^2$, so the
@@ -349,7 +349,7 @@ $\rho$ invariant (see *Relation to Euler–Maruyama* above).
 
 ### Particle systems with translation symmetry
 
-For $n$-particle systems (DW4, LJ13) the energy is invariant under a common
+For $n$-particle systems (DW4, LJ13, LJ55) the energy is invariant under a common
 translation, so the whole machinery runs on the zero-centre-of-mass subspace.
 The prior draw $x_T$, every forward-noised sample $x_t$ and every backward step
 $x_{n-1}$ are projected to zero CoM, and the step-wise densities $p_\rho$ and
@@ -664,7 +664,7 @@ Three properties are worth naming:
 
 1. Draw $B$ samples from buffer $k$ by systematic resampling on its stored IS
    weights.
-2. Draw noise times $t_i\sim\mathrm{Unif}[t_{\min},T]$ (LJ13: $t_i=t_{\min}+(T-t_{\min})u_i^4$) and noise each sample
+2. Draw noise times $t_i\sim\mathrm{Unif}[t_{\min},T]$ (LJ13: $t_i=t_{\min}+(T-t_{\min})u_i^4$; LJ55: $\log t_i\sim\mathrm{Unif}[\log t_{\min},\log T]$) and noise each sample
    through the forward OU kernel,
    $x_{t,i}\sim\mathcal{N}(e^{-t_i}x_{0,i},\sigma_{t_i}^2I)$.
 3. Form the targets $\phi_i=\lambda_{t_i}\beta_k(x_{0,i}-\nabla E(x_{0,i}))$

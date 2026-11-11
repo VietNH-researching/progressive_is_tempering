@@ -51,6 +51,9 @@ progressive_is_tempering/          # repo root
 │   ├── lj13/                      # LJ13 cluster experiment
 │   │   ├── lj13.py
 │   │   └── lj13.ipynb
+│   ├── lj55/                      # LJ55 cluster experiment
+│   │   ├── lj55.py
+│   │   └── lj55.ipynb
 │   └── templates/minimal.py       # minimal training loop template
 │
 ├── tests/                         # pytest suite
@@ -287,7 +290,7 @@ Equivariant Graph Neural Network backbone for particle-system targets. Used in p
 
 ### `utils/smc_diagnostics.py`
 
-SMC seed-quality diagnostics, shared by all four notebooks. Catches two failure modes of the top-rung SMC block, which are not the same thing.
+SMC seed-quality diagnostics, shared by every notebook. Catches two failure modes of the top-rung SMC block, which are not the same thing.
 
 | Symbol | Description |
 |---|---|

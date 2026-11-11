@@ -21,7 +21,7 @@
 #   kill -TERM -- -$(cat results/sweep.pgid)
 #
 # Overrides (environment variables):
-#   TARGETS="gmm dw4 gmm50 lj13"   targets, in run order
+#   TARGETS="gmm dw4 gmm50 lj13 lj55"   targets, in run order
 #   SEEDS="0 1 2"                  seeds per target
 #   GPU=0                          physical GPU index (CUDA_VISIBLE_DEVICES)
 #   PYTHON=python                  interpreter with progressive_is_tempering installed
@@ -32,7 +32,7 @@
 set -uo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-TARGETS="${TARGETS:-gmm dw4 gmm50 lj13}"
+TARGETS="${TARGETS:-gmm dw4 gmm50 lj13 lj55}"
 SEEDS="${SEEDS:-0 1 2}"
 GPU="${GPU:-0}"
 PYTHON="${PYTHON:-python}"
@@ -41,6 +41,7 @@ MAX_FOREIGN_MB="${MAX_FOREIGN_MB:-2000}"
 # lj13's training step needs one large (~15 GiB) scratch buffer for the EGNN
 # backward pass over all rungs, which does not fit in JAX's default pool (75%
 # of the device) once parameters, optimiser state and replay buffers are in it.
+# lj55's gradient step on 128 states needs one ~8 GiB block in the same way.
 MEM_FRACTION="${MEM_FRACTION:-0.95}"
 
 # The sweep's own process group: `kill -TERM -- -<pgid>` stops everything.
