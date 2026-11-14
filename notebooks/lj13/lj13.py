@@ -16,14 +16,8 @@
 # %% [markdown]
 # # Sequential Score Sampler (SSS) — LJ13
 #
-# Trains a $\beta$-conditioned EGNN score network on the 13-particle
-# Lennard-Jones cluster (LJ13, 39-dimensional) using an SMC-discovered
-# temperature ladder. All operations are projected to the zero centre-of-mass
-# subspace throughout (see Section 1 for why this is still exact under the
-# *individual* harmonic trap used here).
-#
-# Run top-to-bottom after a kernel restart. Set `resume = True` to continue
-# from a checkpoint.
+# SSS on the 13-particle Lennard-Jones cluster (LJ13, 39 coordinates). Set
+# `resume = True` to continue from a checkpoint.
 
 # %% [markdown]
 # ## Imports and Seeds
@@ -39,16 +33,9 @@ from functools import partial
 from pathlib import Path
 
 import numpy as np
-# Allocate GPU memory on demand. By default JAX preallocates ~75% of the
-# device's memory at backend init and holds it for the life of the process;
-# on-demand allocation can cost a little speed but lets other processes use the
-# GPU alongside this one. Must precede `import jax`, since the value is read
-# once at backend init; `setdefault` lets the shell override it.
+# Allocate GPU memory on demand.
 os.environ.setdefault("XLA_PYTHON_CLIENT_PREALLOCATE", "false")
-# Deterministic GPU kernels: a given RUN_SEED then reproduces a run's numbers
-# exactly (same hardware and software versions). Without this, XLA may sum
-# GPU reductions and scatters in a different order in each process, and SMC's
-# adaptive ladder turns those last-bit differences into different results.
+# Deterministic GPU ops, so a seed reproduces its run.
 if "--xla_gpu_deterministic_ops" not in os.environ.get("XLA_FLAGS", ""):
     os.environ["XLA_FLAGS"] = (
         os.environ.get("XLA_FLAGS", "") + " --xla_gpu_deterministic_ops=true"
@@ -118,16 +105,12 @@ class ModelConfig:
 @dataclass
 class TrainingConfig:
     """All training / sampling hyperparameters (LJ13-specific values)."""
-    # SDE. Power time grid t_n = T (n/N)^grid_power (Section 6): steps shrink
-    # towards t = 0, so the last one (T / N^2 = 5e-4 at N = 55) adds little
-    # noise to the returned samples.
+    # SDE: power time grid t_n = T (n/N)^grid_power, finest near t = 0.
     T: float = 1.5
     grid_power: float = 2.0
     n_sde_steps_train: int = 55
     n_sde_steps_eval: int = 2000
-    # Inner-loop times t = t_min + (T - t_min) u^t_power, u ~ U(0, 1): with
-    # t_power = 4 most training times sit near t_min, where the last backward
-    # steps query the network.
+    # Inner-loop times t = t_min + (T - t_min) u^t_power, u ~ U(0, 1).
     t_min: float = 1e-4
     t_power: float = 4.0
 
@@ -145,12 +128,8 @@ class TrainingConfig:
     # refresh) or "mala" (full refresh); see `progressive_is_tempering.smc.KERNELS`.
     mcmc_kernel: str = "hmc"
 
-    # Clipping (LJ13: the r^-12 repulsion makes ∇E blow up for close pairs;
-    # clip PER PARTICLE — reshape to (n_particles, spatial_dim) and clamp each
-    # particle's own displacement norm — rather than the whole flat-vector
-    # norm. A single close contact should only damp that pair's target, not
-    # rescale all 13 particles uniformly. See diagnostic cell in Section 13
-    # for the empirical grad-norm distribution behind this default.
+    # Clipping, per particle: the r^-12 repulsion makes ∇E blow up for close
+    # pairs.
     score_clip: float = 1e4
     target_clip_norm: float = 150.0   # per-particle max norm (not global)
 
@@ -159,13 +138,7 @@ class TrainingConfig:
     grad_clip: float = 1.0
 
     # One number governs the SMC population, the per-rung seed, and the buffer
-    # capacity: they are the same particles at three points in their life. SMC
-    # propagates N particles up the ladder, each rung's block is fed whole into
-    # that rung's buffer (never subsampled), and the outer loop evicts them
-    # gradually (FIFO) as backward-SDE data arrives.
-    #
-    # The seed drains in n_smc_particles / n_particles = 5 outer steps, 10% of
-    # num_outer_steps.
+    # capacity: they are the same particles at three points in their life.
     n_smc_particles: int = 25_000
     smc_local_ess_ratio: float = 0.2
     smc_n_mcmc_steps: int = 200
@@ -173,9 +146,7 @@ class TrainingConfig:
     # Checkpointing / logging
     log_every: int = 1
     save_every: int = 1
-    # Outer steps between periodic evaluation plots; None disables them (e.g.
-    # for seed sweeps). Each periodic evaluation draws from the training key,
-    # so a run with None does not reproduce one with plots draw-for-draw.
+    # Outer steps between evaluation plots (None disables them).
     eval_every: int | None = None
     n_eval_particles: int = 20_000
     # Particles in the final evaluation draw, scored by the reported metrics;
@@ -200,10 +171,7 @@ class TrainingConfig:
 model_cfg = ModelConfig()
 train_cfg = TrainingConfig()
 
-# The seed fills every buffer to capacity, so FIFO needs `seed_flush_steps`
-# outer steps to retire it. If that exceeds num_outer_steps the run finishes
-# while still training partly on SMC particles, which are far more degenerate
-# than their row count suggests (see the seed-quality diagnostic).
+# The SMC seed leaves the buffers after seed_flush_steps outer steps.
 _flush = train_cfg.seed_flush_steps
 print(f"buffer: {train_cfg.buffer_capacity:,}/rung "
       f"= {_flush:.3g} generations at K={train_cfg.n_particles:,}")
@@ -217,9 +185,7 @@ if _flush >= train_cfg.num_outer_steps:
 resume: bool = False
 
 NOTEBOOK_NAME = "lj13"
-# Everything a run writes lives in results/<target>/ (results/<target>/seedN/
-# for a seed sweep): checkpoint.pkl, log.txt and figures/ (gitignored) and one
-# <run_id>/metrics.json per evaluated sample set (tracked).
+# Outputs go to results/<target>/[seedN/].
 RESULTS_DIR = Path("../../results") / NOTEBOOK_NAME
 if SEED_DIR is not None:
     RESULTS_DIR = RESULTS_DIR / SEED_DIR
@@ -234,33 +200,17 @@ LOG_PATH = RESULTS_DIR / "log.txt"
 # %% [markdown]
 # ## 1. Target Distribution (LJ13)
 #
-# Thirteen particles in 3D, flat representation $x \in \mathbb{R}^{39}$.
-# Energy:
-# $$U(x) = \underbrace{\sum_{i<j}\varepsilon\Bigl[(r_m/r_{ij})^{12}-2(r_m/r_{ij})^6\Bigr]}_{\text{LJ pair potential}}
-# + \underbrace{\tfrac{s}{2}\sum_i \|x_i\|^2}_{\text{individual harmonic trap}}$$
-# with $\varepsilon=2$, $r_m=1$, $s=1$ (`trap_scale=1.0`, `trap_mode='individual'`).
+# $$E(x)=\sum_{i<j}\varepsilon\bigl[(r_m/r_{ij})^{12}-2(r_m/r_{ij})^6\bigr]+\tfrac{s}{2}\sum_i\|x_i\|^2,\quad\varepsilon=2,\ r_m=1,\ s=1$$
 #
-# **Why we can still work on the zero-CoM subspace.** The individual trap is
-# *not* translation-invariant on its face. But by the parallel-axis theorem,
-# $$\sum_i \|x_i\|^2 = \sum_i \|x_i - \mathrm{CoM}\|^2 + N\|\mathrm{CoM}\|^2,$$
-# so $U$ splits into a CoM-only Gaussian term plus a term depending purely on
-# the CoM-zero (relative) coordinates. Evaluated at any CoM-zero point the
-# $N\|\mathrm{CoM}\|^2$ term vanishes identically, so `energy(x)` restricted
-# to CoM-zero points is exactly (up to an additive constant) the unnormalized
-# log-density of the internal-coordinate marginal. This is why every
-# `project_com` call, and the EGNN's hard-wired zero-CoM output, are exact on
-# this target.
+# All states are kept at zero centre of mass (CoM), where the trap depends only
+# on relative positions.
 
 # %%
 lj13 = LennardJones(n_particles=13, spatial_dim=3, epsilon=2.0, rm=1.0,
                      trap_scale=1.0, trap_mode='individual', beta=1.0)
 
-# Local override of LennardJones.__call__'s pairwise-distance floor: the
-# package hard-codes sqrt(diff**2 + 1e-8), which barely softens the r^-12 term
-# for near-collision pairs (only matters below r ~ sqrt(eps)). We widen the
-# floor to 1e-5 (r ~ 0.0032) to further dampen this blowup during
-# early/off-equilibrium sampling, keeping the shared target unchanged.
-# Params below mirror `lj13` above.
+# Pairwise-distance floor 1e-5 (LennardJones uses 1e-8), softening the r^-12
+# term for near collisions.
 _R_EPS = 1e-5
 
 
@@ -283,10 +233,7 @@ def energy(x: jnp.ndarray) -> jnp.ndarray:
     return -_lj13_logpdf(x)
 
 
-# Quick sanity check. LJ's 1/r^12 term is singular when all particles
-# coincide, so x=0 gives E=inf, grad=nan here — use a random point instead
-# (still huge: randomly scattered particles are far from the equilibrium
-# cluster geometry the LJ potential favours).
+# Quick sanity check.
 key, subkey = jax.random.split(key)
 x_test = jax.random.normal(subkey, (model_cfg.x_dim,))
 print(f"LJ13 dim: {lj13.dim}")
@@ -297,22 +244,10 @@ print(f"∇E norm at random point = {jnp.linalg.norm(jax.grad(energy)(x_test)):.
 # ## 2. Geometry Utilities, Reference Data, and Comparison Plots
 #
 # All particle states are kept in the zero-CoM subspace throughout.
-#
-# This section also holds the ground-truth reference samples and the two
-# summary statistics every comparison in this notebook uses — **pairwise
-# distances** (cluster geometry) and **energy** (how physically plausible a
-# configuration is). They live here, ahead of SMC, because three separate
-# places compare against them: the SMC seed diagnostic (Section 10), the
-# periodic eval during training (Section 14), and the final eval (Section 16).
-# One definition, one styling, so the three are directly comparable.
 
 # %%
 def project_com(x: jnp.ndarray) -> jnp.ndarray:
-    """Project flat (39,) or batched (..., 39) to zero centre-of-mass.
-
-    Subtracts the per-sample mean particle position in each spatial direction.
-    Works for any leading batch dimensions.
-    """
+    """Project flat (39,) or batched (..., 39) to zero centre-of-mass."""
     shape = x.shape
     xr = x.reshape(-1, model_cfg.n_particles, model_cfg.spatial_dim)
     com = xr.mean(axis=-2, keepdims=True)   # (..., 1, D)
@@ -325,7 +260,6 @@ _xr = jax.random.normal(subkey, (5, model_cfg.x_dim))
 _xp = jax.vmap(project_com)(_xr)
 _com = _xp.reshape(5, model_cfg.n_particles, model_cfg.spatial_dim).mean(axis=1)
 print(f"Max |CoM| after projection: {jnp.abs(_com).max():.2e}  (should be ≈ 0)")
-
 
 # %%
 # ---- Summary statistics -----------------------------------------------------
@@ -359,12 +293,6 @@ print(f"Reference energy: mean={float(_REF_E.mean()):.2f}  "
 
 # ---- Comparison plot helpers ------------------------------------------------
 # Two series everywhere: the thing under test vs. the ground-truth reference.
-# The styling, the reference-anchored window, and the honest-density histogram
-# live in `progressive_is_tempering/utils/smc_diagnostics.py` (imported as
-# `style_axis` / `plot_value_comparison` above). Colour follows the entity,
-# never the panel — C_TEST is always whatever we are evaluating (SMC seed, or
-# the model), C_REF is always ground truth — and the reference is additionally a
-# filled histogram, so identity never rests on colour alone.
 _style_axis = style_axis   # local alias: this notebook styles its own axes too
 
 
@@ -377,13 +305,7 @@ def plot_distance_comparison(ax, r_test, label_test, r_ref=_REF_R, bins=150):
 
 
 def plot_energy_comparison(ax, e_test, label_test, e_ref=_REF_E, bins=150):
-    """Energy density: test vs reference, on shared bin edges.
-
-    Energy is the sharper of the two statistics: it weights close contacts by
-    r^-12, so a single bad pair moves it by orders of magnitude while barely
-    perturbing the distance histogram. The off-window fraction reported here is
-    the real early-training diagnostic.
-    """
+    """Energy density: test vs reference, on shared bin edges."""
     return plot_value_comparison(
         ax, e_test, e_ref, "energy $E(x)$", label_test, bins=bins,
     )
@@ -391,10 +313,7 @@ def plot_energy_comparison(ax, e_test, label_test, e_ref=_REF_E, bins=150):
 # %% [markdown]
 # ## 3. Tempering Problem for LJ13
 #
-# The geometric path bridges
-# $\rho(x) = \mathcal{N}(x;0,I)$ (restricted to CoM=0)
-# to $\pi(x) \propto e^{-E(x)}$ via
-# $\pi_\beta(x) \propto \exp\{-(1-\beta)\tfrac12\|x\|^2 - \beta E(x)\}$.
+# Geometric path from $\mathcal N(0,I)$ (zero CoM) to $\pi$.
 
 # %%
 def logpdf_ref(x: jnp.ndarray) -> jnp.ndarray:
@@ -411,7 +330,6 @@ def rvs_ref(key: jnp.ndarray) -> jnp.ndarray:
     """Draw one sample from N(0, I) projected to zero CoM."""
     return project_com(jax.random.normal(key, (model_cfg.x_dim,)))
 
-
 # %%
 # pt_problem is built here (rather than at the SMC call in Section 9) so
 # Section 7's HMC demo can also use it.
@@ -424,10 +342,7 @@ pt_problem = PTProblem(
 # %% [markdown]
 # ## 4. Forward Process
 #
-# OU SDE with closed-form marginals:
-# $X_t \mid X_0 \sim \mathcal{N}(e^{-t}X_0, \sigma_t^2 I)$,
-# $\sigma_t^2 = 1 - e^{-2t}$.
-# After noising we project back to zero CoM.
+# OU process $dX_t=-X_t\,dt+\sqrt2\,dW_t$, close to $\mathcal N(0,I)$ at $t=T$.
 
 # %%
 @jax.jit
@@ -436,18 +351,11 @@ def ou_forward_sample_com(key: jnp.ndarray, x0: jnp.ndarray, t: float) -> jnp.nd
     xt = ou_forward_sample(key, x0, t)
     return project_com(xt)
 
-
 # %% [markdown]
 # ## 5. Score Network (EGNN)
 #
-# $\beta$-conditioned $E(n)$-equivariant GNN dynamics network
-# $s_\theta(x_t, t, \beta)$ approximating the excess score
-# $\nabla_{x_t}\log(p_t^\beta / p_t^\rho)$.
-#
-# Input: flat coordinates $x_t \in \mathbb{R}^{39}$, time $t$, temperature $\beta$.
-# Interface: **batched** — `(B, 39)`, `(B, 1)`, `(B, 1)` → `(B, 39)`.
-# The EGNN output is automatically zero-CoM (velocity = displacement from input,
-# CoM-projected inside `EGNNDynamics`).
+# $\beta$-conditioned EGNN for the excess score
+# $s_\theta(x_t,t,\beta)\approx\nabla\log(p_t^\beta/p_t^\rho)$.
 
 # %%
 score_net = EGNNDynamics(
@@ -477,23 +385,7 @@ print(f"n_particles={model_cfg.n_particles}, spatial_dim={model_cfg.spatial_dim}
 # %% [markdown]
 # ## 6. CoM-Projected Backward SDE
 #
-# The backward SDE time-reversal of the OU process, with CoM projection applied
-# after each exponential-integrator step. Both the forward OU density
-# $p_\rho(x_n \mid x_{n-1})$ and the backward proposal
-# $q_\theta(x_{n-1} \mid x_n)$ are evaluated at the projected state.
-#
-# The time grid is a **power** grid: $t_n=T\,(n/N)^2$ for $n=0,\dots,N$, with
-# each step using its own $\Delta t_n=t_n-t_{n-1}$ (`power_time_grid` in
-# `progressive_is_tempering/sampler.py`). Steps shrink towards $t=0$; with $T=1.5$
-# the last one is $1.5/55^2\approx5\times10^{-4}$ in training and
-# $1.5/2000^2\approx4\times10^{-7}$ at evaluation. The last step adds noise of scale
-# $\sigma_1=\sqrt{1-e^{-2\Delta t_1}}$ to the returned samples that no control can
-# remove, so a small terminal step matters far more than the step count. The
-# step coefficients use `expm1`, since $1-e^{-\Delta t}$ loses its digits in
-# float32 for such small steps.
-#
-# All particles advance together: the EGNN (batched interface) is called once
-# per time step on the whole `(K, 39)` batch.
+# Backward SDE with a zero-CoM projection after every step.
 
 # %%
 def backward_sde_batch_com(
@@ -506,13 +398,7 @@ def backward_sde_batch_com(
     T: float,
     n_steps: int,
 ) -> tuple[jnp.ndarray, jnp.ndarray]:
-    """Batched backward SDE: all n_particles processed together in one scan.
-
-    control_fn(x, t, beta) receives x of shape (n_particles, dim) and returns
-    the same shape — one EGNN call per time step rather than one per particle.
-
-    Returns x0 (K, dim) and path-space log-weights (K,).
-    """
+    """Batched backward SDE: all n_particles processed together in one scan."""
     times, dts = power_time_grid(T, n_steps, train_cfg.grid_power)
 
     key, subkey = jax.random.split(key)
@@ -586,20 +472,8 @@ print(f"  Max |CoM| in samples: {jnp.abs(_com_demo).max():.2e}  (should be ≈ 0
 # %% [markdown]
 # ## 7. CoM-Projected HMC Rejuvenation
 #
-# Rejuvenation uses the covariance-preconditioned HMC kernel (`rejuvenate`,
-# from `progressive_is_tempering/rejuvenate.py`; `train_cfg.mcmc_kernel` picks
-# partial-refresh `hmc_kernel`, the default, or full-refresh `mala_kernel`)
-# with the parameters SMC
-# (Section 9) tunes per rung. The kernel has no CoM-awareness at all, so
-# `rejuvenate`'s `project_fn` hook re-projects to zero-CoM after *every*
-# internal move, never leaving the constraint manifold. The harmonic trap
-# depends on the CoM, so the energy is re-evaluated after each projection
-# (no `project_invariant`).
-#
-# This demo runs before SMC has produced a real ladder, so it adapts a
-# throwaway kernel with the kernel's own `adapt_params` at an illustrative
-# rung. Training does not use it: training uses the kernels SMC adapts in
-# Section 9.
+# HMC moves at rung $k$ with the kernel SMC tuned for that rung (Section 9),
+# projected to zero CoM.
 
 # %%
 _demo_beta, _demo_t_idx = jnp.array(0.1), 1
@@ -621,17 +495,12 @@ print(f"HMC demo (β={float(_demo_beta):.3f}, rung 1, 5 steps): "
 # %% [markdown]
 # ## 8. IS Bridging Between Adjacent Temperatures
 #
-# $$\log w_{k \to k+1}(x) = (\beta_{k+1}-\beta_k)\bigl(-E(x)+\tfrac12\|x\|^2\bigr)$$
+# $$\log w_{k\to k+1}(x)=(\beta_{k+1}-\beta_k)\bigl(\tfrac12\|x\|^2-E(x)\bigr)$$
 
 # %%
 @jax.jit
 def is_bridge_log_weights(samples, beta_k, beta_next):
-    """IS log-weights to bridge π_{β_k} → π_{β_{k+1}}.
-
-    Reference definition of the formula above, kept for interactive diagnostics.
-    The training path does not call it: `_data_gen_parallel` (Section 12)
-    recomputes it inline so the whole pipeline stays inside one jit region.
-    """
+    """IS log-weights to bridge π_{β_k} → π_{β_{k+1}}."""
     delta_beta = beta_next - beta_k
     energies = jax.vmap(energy)(samples)
     norms_sq = jnp.sum(samples ** 2, axis=-1)
@@ -640,18 +509,7 @@ def is_bridge_log_weights(samples, beta_k, beta_next):
 
 @jax.jit
 def normalize_log_weights(log_w: jnp.ndarray) -> jnp.ndarray:
-    """Shift a block of log-weights to mean weight 1 (i.e. logsumexp = log n).
-
-    A buffer holds several blocks written at different times, and `.sample()`
-    resamples across all of them jointly — so the blocks' weight *scales* must
-    be commensurable. Raw bridge weights Δβ(-E + ½‖x‖²) run O(10-100) for LJ13,
-    whereas the SMC seed particles are already ≈ π_{β_k} and so carry weight 0.
-    Mixing those two raw would let one block dominate the buffer outright,
-    depending only on sign. Normalizing every block on the way in makes blocks
-    combine in proportion to their particle counts, which is what we want.
-
-    Degenerate blocks (all weights -inf) fall back to uniform.
-    """
+    """Shift a block of log-weights to mean weight 1 (i.e. logsumexp = log n)."""
     n = log_w.shape[0]
     total = logsumexp(log_w)
     return jnp.where(
@@ -660,25 +518,11 @@ def normalize_log_weights(log_w: jnp.ndarray) -> jnp.ndarray:
         jnp.zeros_like(log_w),
     )
 
-
 # %% [markdown]
 # ## 9. Temperature Ladder via SMC
 #
-# Run SMC once before training to discover $\{\beta_k\}_{k=0}^M$ such that
-# successive IS bridges have normalized ESS $\geq$ `local_ess_ratio`. SMC
-# moves with the HMC kernel (the same one `rejuvenate` uses, below).
-#
-# `smc_sampler` returns the particle positions at **every** rung,
-# stacked as `(len(betas_list), n_smc_particles, 39)` and indexed in the same
-# order as `betas_list`. These are the only samples in the whole script that
-# are actually distributed according to $\pi_{\beta_k}$ at each level, and are
-# used to seed the replay buffers (Section 11).
-#
-# It additionally returns the per-rung HMC kernel
-# (covariance + step size) SMC itself adapted while building the ladder. That
-# kernel is reused as-is for outer-loop rejuvenation (Section 12); see
-# `rejuvenate`. The buffer seed (Section 11) uses SMC's particle output
-# directly, with no further HMC pass.
+# Adaptive SMC gives the ladder $\{\beta_k\}$, one particle block per rung (the
+# buffer seeds) and one tuned HMC kernel per rung (reused for rejuvenation).
 
 # %%
 # pt_problem was built in Section 3.
@@ -708,9 +552,7 @@ if _ckpt_data is None:
     print(f"Temperature ladder ({len(betas_list)} levels): {[f'{b:.3f}' for b in betas_list]}")
     print(f"logZ estimates: {logZ_dict}")
 
-    # Scalar HMC step size (ε), adapted per rung by SMC's own acceptance-rate
-    # bisection (MALAParameters.scaled_cov.eps) — the same value reused wherever
-    # mcmc_params_by_rung is indexed below.
+    # Per-rung HMC step size adapted by SMC.
     _eps_by_rung = mcmc_params_by_rung.scaled_cov.eps
     print("HMC step size (ε) adapted by SMC, per rung:")
     for _k, _eps_k in enumerate(_eps_by_rung, start=1):
@@ -720,11 +562,7 @@ if _ckpt_data is None:
     M = len(betas_list) - 1
     print(f"M={M} non-reference temperature levels")
 
-    # Project the SMC particles onto the zero-CoM subspace. The HMC kernel does
-    # not project (nothing in mala_kernel.py touches the CoM), and the
-    # individual trap only *confines* the CoM rather than pinning it — the CoM
-    # random-walks with std ~ 1/sqrt(N·s·β) per direction. Everything downstream
-    # of here assumes CoM-zero states, so project once, at the boundary.
+    # Project the SMC particles onto the zero-CoM subspace.
     smc_states = jax.vmap(jax.vmap(project_com))(smc_particles)  # (n_levels, N, 39)
     assert smc_states.shape[0] == len(betas_list), (
         f"expected one particle block per rung, got {smc_states.shape[0]} "
@@ -744,36 +582,7 @@ else:
 # %% [markdown]
 # ## 10. SMC Seed Quality at $\beta = 1$
 #
-# The top rung of the SMC ladder targets $\pi_{\beta_M} = \pi$ — the same
-# distribution the reference set is drawn from — so the two should agree. This
-# is the one check worth running *before* committing to a training run: it puts
-# a ceiling on what the seeded buffers can teach the network. If SMC has not
-# reached the target at $\beta = 1$, no amount of training on its output will.
-#
-# Two failure modes, and they are not the same thing:
-#
-# 1. **Distributional mismatch** (top row). Both statistics are shown because
-#    they fail differently. Pairwise distances describe cluster *geometry* and
-#    are forgiving — a badly-strained cluster can still produce a
-#    plausible-looking distance histogram. Energy is the sharp test: it weights
-#    close contacts by $r^{-12}$, so a single bad pair moves it by orders of
-#    magnitude. Agreement on distances but not energy means the geometry is
-#    roughly right and the fine structure is not.
-# 2. **Ancestral degeneracy** (bottom row). The histograms match beautifully,
-#    yet the population carries far less independent information than its
-#    particle count suggests. SMC resampling collapses the ancestral lineages;
-#    local MCMC then re-equilibrates each particle *within* its basin, erasing
-#    literal duplicates while the basin assignment stays frozen. A distinct-row
-#    count reports 100% unique and misses this entirely.
-#
-# The degeneracy test uses the 78 pairwise distances as exchangeable features:
-# particle-permutation symmetry means every pair must give the same exceedance
-# probability $P(r_{ij} > \tau)$. The reference set goes through the identical
-# computation as a control — being i.i.d., it should recover its own size, which
-# is what makes the test's verdict on the SMC block trustworthy. See
-# `progressive_is_tempering/utils/smc_diagnostics.py`.
-#
-# Skipped on resume, where `smc_states` does not exist.
+# The top SMC rung against the reference samples.
 
 # %%
 if _ckpt_data is None:
@@ -809,23 +618,8 @@ else:
 # %% [markdown]
 # ## 11. Per-Temperature Replay Buffers (Seeded from SMC)
 #
-# Each row stores $(x, \log w)$ and $\nabla E(x)$, computed once when the row is
-# written, for the TSM targets of Section 13.
-#
-# Buffer 0 ($\beta=0$): i.i.d. $\mathcal{N}(0,I)$ projected to zero CoM, frozen.
-# The reference *is* the $\beta=0$ target, so exact draws beat SMC particles here.
-#
-# Buffers $1,\ldots,M$: seeded directly with this rung's SMC particles — the
-# particles SMC itself already produced after its own reweight/resample/HMC
-# move at that rung (Section 9), with no further rejuvenation applied here.
-# Buffers $2,\ldots,M$ additionally receive backward-SDE data during training,
-# and FIFO eviction retires the seed once ~`buffer_capacity` new samples have
-# arrived.
-#
-# Seed particles are already $\approx \pi_{\beta_k}$, so they enter with
-# **uniform** log-weights — no bridge weights (those are for particles arriving
-# from the rung below). See `normalize_log_weights` in Section 8 for why every
-# block is normalized on the way in.
+# Buffer 0 holds exact $\mathcal N(0,I)$ draws; buffer $k\ge1$ starts with rung
+# $k$'s SMC block. The outer loop refreshes buffers $2,\dots,M$ (FIFO).
 
 # %%
 if _ckpt_data is None:
@@ -835,9 +629,7 @@ if _ckpt_data is None:
         for _ in range(len(betas_list))
     ]
 
-    # Buffer 0: exact projected N(0, I), frozen. Filled to capacity rather than
-    # to n_particles: it is never evicted, and exact draws are free, so leaving
-    # slots empty would only narrow the β=0 training data for no reason.
+    # Buffer 0: exact projected N(0, I), frozen.
     key, subkey = jax.random.split(key)
     buf0_samples = jax.vmap(project_com)(
         jax.random.normal(subkey, (train_cfg.buffer_capacity, model_cfg.x_dim))
@@ -849,10 +641,7 @@ if _ckpt_data is None:
     buffers[0].freeze()
     print(f"Buffer 0 (β=0): {buffers[0].size} samples, uniform weights [frozen]")
 
-    # Buffers 1..M: the whole SMC block at the matching rung — SMC's own
-    # reweight/resample/HMC move (Section 9) already produced these, already
-    # projected to zero CoM. The block is exactly buffer capacity, so each
-    # buffer starts full and the seed drains over seed_flush_steps outer steps.
+    # Buffers 1..M: the whole SMC block of the matching rung (zero CoM).
     assert smc_states.shape[1] == train_cfg.buffer_capacity, (
         f"SMC block {smc_states.shape[1]:,} must equal capacity "
         f"{train_cfg.buffer_capacity:,}; ReplayBuffer.add would otherwise write "
@@ -868,8 +657,7 @@ if _ckpt_data is None:
         print(f"  Buffer {_k} (β={float(betas[_k]):.3f}): {buffers[_k].size} samples{_frozen}")
 
     # Buffer 1 is never written during training (the outer loop fills 2..M), so
-    # it stays frozen. It holds genuine π_{β_1} particles from SMC, so its ESS
-    # is 1.0.
+    # it stays frozen.
     if len(betas_list) >= 2:
         buffers[1].freeze()
     print(f"Seeding done in {time.time()-t0:.1f}s")
@@ -884,11 +672,8 @@ else:
 # %% [markdown]
 # ## 12. Parallel Data Generation (Outer Loop)
 #
-# For each active temperature level $k \in \{1,\ldots,M-1\}$ **in parallel**:
-# 1. Backward SDE at $\beta_k$ → $(x_0^{(i)}, \log w_\mathrm{path}^{(i)})$
-# 2. Systematic resample → approx. i.i.d. from $\pi_{\beta_k}$
-# 3. CoM-projected HMC rejuvenation
-# 4. IS bridge weights → $\log w_{k \to k+1}$
+# For every rung $k=1,\dots,M-1$ in parallel: backward SDE, resampling, HMC
+# rejuvenation, bridge weights to rung $k+1$.
 
 # %%
 @partial(jax.jit, static_argnums=(3, 4, 5, 6, 7, 8, 9))
@@ -934,9 +719,9 @@ def _data_gen_parallel(
         # 2. Systematic resample
         resample_idx = systematic_resample(resample_key, log_w_path, n_particles)
         x0_resampled = x0_batch[resample_idx]
-        # 3. HMC rejuvenation, using the same SMC-tuned kernel from Section 9
-        #    No project_invariant: the harmonic trap depends on the CoM, so the
-        #    energy is re-evaluated after each re-projection.
+        # 3. HMC rejuvenation with the SMC-tuned kernel of rung k. The trap
+        # depends on the CoM, so the energy is re-evaluated after each
+        # re-projection.
         x0_rejuv, mala_acc, energies = rejuvenate(
             mala_key, x0_resampled, pt_problem, beta_k, t_idx_k,
             mcmc_params_k, n_mala_steps, project_fn=project_com,
@@ -956,31 +741,15 @@ def _data_gen_parallel(
         t_idx_active, mcmc_params_active,
     )
 
-
 # %% [markdown]
 # ## 13. Training Step (Inner Loop)
 #
-# Target Score Matching (TSM) target for LJ13, built from the score of the
-# clean sample $x_0$:
-# $$\phi(x_0,t,\beta) = e^{-t}\,\beta\,(x_0 - \nabla E(x_0))$$
-# $\nabla E(x_0)$ is read from the buffer row (Section 11), not recomputed.
-# EGNN is called on the full batch `((M+1)*B, 39)` directly (no per-sample vmap).
-# Forward-noised samples are projected to zero CoM before passing to the network.
-#
-# The target is clipped **per particle** (reshape to `(n_particles,
-# spatial_dim)`, clamp each particle's own displacement norm) rather than by
-# the whole flat-vector norm — a single close contact should only damp that
-# pair's own target, not rescale all 13 particles uniformly; see the
-# diagnostic below for the empirical grad-norm distribution behind this choice.
+# TSM loss on all buffers jointly, with the target clipped per particle; one
+# Adam step.
 
 # %%
 def clip_per_particle_norm(x_flat: jnp.ndarray, max_norm: float) -> jnp.ndarray:
-    """Clamp each particle's own vector norm to max_norm, direction preserved.
-
-    x_flat: (..., n_particles * spatial_dim). A single close contact only
-    damps that particle pair's own displacement, unlike a whole-vector clip
-    which would rescale all particles uniformly.
-    """
+    """Clamp each particle's own vector norm to max_norm, direction preserved."""
     shape = x_flat.shape
     xr = x_flat.reshape(-1, model_cfg.n_particles, model_cfg.spatial_dim)
     norms = jnp.linalg.norm(xr, axis=-1, keepdims=True)
@@ -988,10 +757,7 @@ def clip_per_particle_norm(x_flat: jnp.ndarray, max_norm: float) -> jnp.ndarray:
     return (xr * clip_coeff).reshape(shape)
 
 
-# Diagnostic: empirical per-particle |∇E| distribution, equilibrium vs.
-# off-equilibrium (random Gaussian — representative of early backward-SDE /
-# low-β configurations, where a chance close pair can make ∇E blow up by many
-# orders of magnitude). Sanity-checks the target_clip_norm default above.
+# Diagnostic: per-particle |∇E| at equilibrium vs. at random Gaussian states.
 _grad_fn_demo = jax.vmap(jax.grad(energy))
 key, subkey = jax.random.split(key)
 _gt_probe = jax.vmap(project_com)(jax.random.normal(subkey, (2000, model_cfg.x_dim)))
@@ -1012,11 +778,7 @@ opt_state = optimizer.init(params)
 
 @jax.jit
 def train_step(params, opt_state, xg_all, t_all, beta_all, key):
-    """Loss, gradient, and Adam update.
-
-    xg_all: ((M+1)*B, 78) buffer rows [x0 | ∇E(x0)], t_all: ((M+1)*B,),
-    beta_all: ((M+1)*B,)
-    """
+    """Loss, gradient, and Adam update."""
     _d = xg_all.shape[1] // 2
     x0_all, g_all = xg_all[:, :_d], xg_all[:, _d:]
     target_clip = train_cfg.target_clip_norm
@@ -1058,28 +820,14 @@ def train_step(params, opt_state, xg_all, t_all, beta_all, key):
     params_new = optax.apply_updates(params, updates)
     return params_new, opt_state_new, loss
 
-
 # %% [markdown]
 # ## 14. Periodic Evaluation
 #
-# Same three candidate sample sets and two summary statistics as the final
-# evaluation (Section 16) — pairwise distances and energy, for raw backward-SDE
-# output, IS-resampled backward-SDE output, and buffer[M] — run every
-# `eval_every` outer steps so the training-time figures are directly comparable
-# to the end-of-run one (minus its loss-curve column).
-#
-# Energy is the statistic that moves first. Early in training the model puts
-# mass on configurations with close contacts, whose $r^{-12}$ energies are
-# enormous; that shows up as a large off-window fraction long before the
-# distance histogram looks obviously wrong.
+# The final-evaluation figure, every `eval_every` outer steps.
 
 # %%
 def periodic_eval_plot(params, outer_step):
-    """Same three candidate sample sets and two summary statistics as the final
-    evaluation (Section 16) — distances (top row) and energy (bottom row) for
-    raw backward-SDE output, IS-resampled backward-SDE output, and buffer[M] —
-    minus the loss-curve column, which belongs to the end-of-run figure only.
-    """
+    """Plot the three evaluation sample sets (distances and energy)."""
     global key
 
     key, subkey = jax.random.split(key)
@@ -1147,19 +895,8 @@ def periodic_eval_plot(params, outer_step):
 # %% [markdown]
 # ## 15. Training Loop
 #
-# ```
-# for outer_step in 1 … num_outer_steps:
-#     for k = 1, …, M−1:  (parallel via jax.vmap)
-#         CoM-projected backward SDE at β_k  →  (x₀, log w_path)
-#         systematic resample  →  approx. i.i.d. from π_{β_k}
-#         CoM-projected HMC rejuvenation
-#         IS bridge weights    →  log w_{k→k+1}
-#         buffer[k+1].add(x₀, log w_{k→k+1})
-#     for inner_step in 1 … n_inner_steps:
-#         sample mini-batches from each buffer
-#         project-noised xt, compute TSM targets
-#         Adam step on joint loss via batched EGNN
-# ```
+# Each outer step generates data at every rung; `n_inner_steps` Adam steps then
+# train on all buffers jointly.
 
 # %%
 start_outer_step = 0
@@ -1200,9 +937,7 @@ for outer_step in range(start_outer_step, train_cfg.num_outer_steps):
         resamp_keys = all_keys[M_active + 1 : 2 * M_active + 1]
         mala_keys   = all_keys[2 * M_active + 1:]
 
-        # Active rungs are k = 1 … M-1 (M_active of them); mcmc_params_by_rung[k-1]
-        # is the MALAParameters SMC tuned for rung k (Section 9), so slice its
-        # first M_active entries to match betas[1:-1].
+        # Rungs k = 1 … M-1; mcmc_params_by_rung[k-1] belongs to rung k.
         t_idx_active = jnp.arange(1, M)
         mcmc_params_active = jax.tree_util.tree_map(
             lambda leaf: leaf[:M_active], mcmc_params_by_rung
@@ -1222,9 +957,7 @@ for outer_step in range(start_outer_step, train_cfg.num_outer_steps):
         outer_ess_list = path_ess_all.tolist()
 
         for i in range(M_active):
-            # Normalize each block on the way in so it is commensurable with
-            # the uniform-weight SMC seed already in the buffer, and with
-            # blocks written at earlier outer steps (Section 8).
+            # Normalize each block to mean weight 1 before adding it.
             buffers[i + 2].add(x0_rejuv_all[i], normalize_log_weights(bridge_lw_all[i]),
                                grads_all[i])
 
@@ -1312,17 +1045,9 @@ print(f"\nTraining complete in {time.time()-train_start:.1f}s")
 # %% [markdown]
 # ## 16. Final Evaluation
 #
-# Run the backward SDE at $\beta=1$ and compare the model against the
-# ground-truth reference on pairwise distances and energy, alongside the
-# training loss curve.
-#
-# The three panels answer three different questions and are deliberately not
-# combined: distances say whether the *geometry* is right, energy says whether
-# the *physics* is right, and the loss curve says whether the network converged
-# at all. Loss keeps its own log-scale axis in its own panel — it shares no
-# units with either statistic.
-#
-# Reference samples were loaded once in Section 2; nothing to re-run here.
+# Backward SDE at $\beta=1$ with `n_sde_steps_eval` steps, scored as three
+# sample sets: raw SDE output (`sde_raw`), the same particles resampled on their
+# path weights (`sde_is`), and `buffer[M]` (`buffer`).
 
 # %%
 print("Running final evaluation …")
@@ -1337,22 +1062,6 @@ print(f"Evaluation path-space ESS (β=1): {ess_eval:.3f}")
 
 # %% [markdown]
 # ### Three candidate definitions of "our method's samples"
-#
-# | # | Sample set | What it isolates |
-# |---|---|---|
-# | 1 | Backward SDE output, **no** reweighting | the learned score alone |
-# | 2 | Same run, IS-resampled on the path weights | score **+** path-space correction |
-# | 3 | `buffer[M]`, IS-resampled on its stored weights | the training data at $\beta=1$ |
-#
-# (1) and (2) come from the **single** SDE run above — the same particles,
-# differing only in whether `log w_path` is applied — so any gap between them is
-# exactly the work the importance correction is doing. If they agree, the
-# network learned the target; if only (2) matches, the reweighting is carrying
-# the result and `ess_eval` says how few particles are really behind it.
-#
-# (3) needs no SDE run: it is what the outer loop deposited at the top rung,
-# i.e. what the inner loop actually trained on. It bounds what the network could
-# have learned — a network cannot beat its own training data.
 
 # %%
 # (1) Raw backward-SDE output: the network alone, no correction.
@@ -1363,11 +1072,8 @@ key, subkey = jax.random.split(key)
 resamp_idx = systematic_resample(subkey, lw_eval, len(lw_eval))
 x_resamp = x0_eval[resamp_idx]
 
-# (3) buffer[M]: the training data at β=1, drawn the way the inner loop draws
-# it — systematic resampling on the stored IS weights. Raw buffer contents
-# would NOT be π-distributed: the blocks arriving from the outer loop are
-# ≈ π_{β_{M-1}} particles carrying bridge weights to β_M, and only become ≈ π
-# once those weights are applied. `.sample()` applies them.
+# (3) buffer[M]: the training data at β=1, drawn the way the inner loop draws it
+# — systematic resampling on the stored IS weights.
 if buffers[M].is_ready(1):
     key, subkey = jax.random.split(key)
     n_buf = min(train_cfg.n_eval_samples, buffers[M].size)
@@ -1388,10 +1094,6 @@ sample_sets = [
 
 # %%
 # Columns: the three candidate sample sets, plus the loss curve.
-# Rows: the two summary statistics. Distances say whether the *geometry* is
-# right, energy says whether the *physics* is right — energy is far the sharper
-# test, since r^-12 punishes close contacts. Every panel carries the same
-# filled ground-truth reference, so the three sets are read against each other.
 fig, axes = plt.subplots(2, 4, figsize=(21, 8))
 
 _summary = []
@@ -1455,32 +1157,7 @@ print()
 # %% [markdown]
 # ### Reported metrics: Distance-𝒲₂, Energy-𝒲₂, Geometric-𝒲₂
 #
-# The three numbers reported for the method, computed by
-# `progressive_is_tempering.utils.metrics`; lower
-# is better for all three.
-#
-# - **Distance-𝒲₂** — 𝒲₂ between the pooled pairwise distances (78 per
-#   configuration), all thrown into one 1-D distribution.
-# - **Energy-𝒲₂** — 𝒲₂ between the energy distributions. Non-finite energies
-#   are dropped first.
-# - **Geometric-𝒲₂** — exact optimal transport between configurations, with the
-#   ground distance taken modulo particle permutation and rotation/reflection:
-#   linear assignment on unaligned coordinates first, then orthogonal
-#   Procrustes over O(3). That one-shot alignment is an upper bound on the true
-#   ground distance, and matches the published definition.
-#
-# Every sample set is scored against the whole reference set
-# (10,000 configurations); a set larger than that is first subsampled to the
-# same size, without replacement and with a fixed seed. Geometric-𝒲₂ needs one
-# alignment per (sample, reference) pair — 10⁸ at 10k × 10k — and runs on all
-# CPU cores but one: several minutes on 48 cores per sample set.
-#
-# Each set is also written as its own record,
-# `results/lj13/[seedN/]<run_id>/metrics.json` with `run_id` ∈ {`sde_raw`, `sde_is`,
-# `buffer`}, under the metric names `w2_pooled` (Distance-𝒲₂), `w2_energy`
-# (Energy-𝒲₂) and `geometric_w2` (Geometric-𝒲₂). A
-# record also carries the energy means, the ESS and the full configuration.
-# A new run overwrites the previous run's records in the same folder.
+# Written to `results/lj13/[seedN/]<run_id>/metrics.json`.
 
 # %%
 _ref_np = np.asarray(_pt_ref)

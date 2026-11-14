@@ -15,27 +15,10 @@
 # %% [markdown]
 # # Minimal progressive_is_tempering notebook
 #
-# The whole method end to end, as small as it goes: SMC ladder → seeded buffers
-# → outer data generation → inner training → evaluation. On a 4-D GMM it runs in
-# well under a minute. It exists to be copied as the starting point for a new
-# target, not to produce results.
-#
-# **To adapt it:** swap the target in §1 for yours — anything exposing `energy`,
-# `rvs_ref`, `logpdf_ref` and `logpdf_final_target` — then raise the config and
-# add whatever plots, logging and diagnostics that target needs. Those stay in
-# your notebook; shared algorithm code belongs in `progressive_is_tempering/`.
-#
-# **Two ways this is smaller than a real experiment**, worth knowing before you
-# scale it:
-#
-# 1. The outer loop here is a plain Python loop over temperature levels, for
-#    readability. The real notebooks run every level at once under a single
-#    `jax.vmap` — see `_data_gen_parallel` in `notebooks/gmm/gmm.py` and copy
-#    that once particle counts get serious. Buffer writes stay sequential and
-#    outside the vmap either way.
-# 2. Targets with a translation symmetry (molecules) must project the SMC stack
-#    to zero centre of mass before any downstream use, and pass `project_fn` to
-#    `rejuvenate`. The GMM has no such symmetry, so nothing is projected here.
+# The method end to end on a 4-D GMM, as small as possible: a starting point for
+# a new target. Rungs are processed in a Python loop here; `jax.vmap` over rungs
+# is faster. Translation-invariant targets also need a zero-CoM projection
+# (`project_fn` in `rejuvenate`).
 
 # %%
 import os
@@ -43,9 +26,7 @@ import os
 # Allocate GPU memory on demand instead of preallocating ~75% of the device at
 # backend init, so the GPU stays shareable. Must precede `import jax`.
 os.environ.setdefault("XLA_PYTHON_CLIENT_PREALLOCATE", "false")
-# Uncomment to pin a device, and to make the run reproducible: without
-# deterministic ops, GPU floating-point wobble is amplified by SMC's adaptive
-# bisection into a *different temperature ladder* from the same seed.
+# Uncomment to pin a device and to make runs reproducible (deterministic GPU ops).
 # os.environ.setdefault("CUDA_VISIBLE_DEVICES", "0")
 # os.environ["XLA_FLAGS"] = (os.environ.get("XLA_FLAGS", "")
 #     + " --xla_gpu_deterministic_ops=true --xla_gpu_autotune_level=0").strip()
@@ -71,12 +52,6 @@ print(f"JAX devices: {jax.devices()}")
 
 # %% [markdown]
 # ## 0. Configuration
-#
-# `N_SMC_PARTICLES` is one knob serving three roles — SMC population, per-rung
-# buffer seed, and buffer capacity — because they are the same particles at
-# three points in their life. The seed drains over
-# `N_SMC_PARTICLES / N_PARTICLES` outer steps; keep that below
-# `NUM_OUTER_STEPS` or the run ends while still training on SMC particles.
 
 # %%
 DIM = 4
@@ -101,8 +76,8 @@ print(f"seed drains after {N_SMC_PARTICLES / N_PARTICLES:.3g} of "
 # %% [markdown]
 # ## 1. Target
 #
-# Replace this with your own. The rest of the notebook only ever touches
-# `target.energy` and the three `PTProblem` methods.
+# Replace with your own target: the notebook uses `target.energy` and the three
+# `PTProblem` methods.
 
 # %%
 target = make_gmm_target(dim=DIM)
@@ -117,9 +92,8 @@ pt_problem = PTProblem(
 # %% [markdown]
 # ## 2. Temperature ladder via SMC
 #
-# One SMC sweep yields three things at once, all consumed below and none
-# recomputed: the ladder `{β_k}`, a particle block at every rung, and the HMC
-# kernel SMC adapted per rung (reused for outer-loop rejuvenation).
+# SMC gives the ladder, a particle block per rung and a tuned HMC kernel per
+# rung.
 
 # %%
 key, subkey = jax.random.split(key)
@@ -134,20 +108,14 @@ print(f"ladder ({len(betas_list)} levels): {[f'{b:.3f}' for b in betas_list]}")
 
 
 def mcmc_params_for_rung(k):
-    """MALAParameters SMC adapted for rung k (k = 1 … M).
-
-    `mcmc_params_by_rung` is a *stacked* pytree with rung on the leading axis;
-    indexing it directly would select a NamedTuple field, not a rung.
-    """
+    """MALAParameters SMC adapted for rung k (k = 1 … M)."""
     return jax.tree_util.tree_map(lambda leaf: leaf[k - 1], mcmc_params_by_rung)
-
 
 # %% [markdown]
 # ## 3. Score network
 #
-# `s_θ(x, t, β)` learns the *excess* score over the reference, which is
-# identically zero at β=0 — hence the near-zero output initialisation. The
-# interface is unbatched: always call it through `jax.vmap`.
+# Excess score over the reference (zero at β=0); unbatched, so call it through
+# `jax.vmap`.
 
 # %%
 score_net = ScoreNetwork(x_dim=DIM, hidden_dim=128, n_blocks=2)
@@ -164,14 +132,11 @@ def make_control(p):
     """Backward-SDE drift correction u_θ(x, t, β) = 2 s_θ(x, t, β)."""
     return lambda x, t, b: 2.0 * score_net.apply(p, x, t, b)
 
-
 # %% [markdown]
 # ## 4. Replay buffers, seeded from SMC
 #
-# Buffer 0 (β=0) holds exact N(0, I) draws — at β=0 the reference *is* the
-# target, so exact draws beat SMC particles. Buffers 1…M take that rung's whole
-# SMC block, which is already ≈ π_{β_k} and so enters with uniform weights.
-# Buffers 0 and 1 are frozen; the outer loop writes only 2…M.
+# Buffer 0: exact N(0, I) draws; buffers 1…M: that rung's SMC block. The outer
+# loop writes buffers 2…M.
 
 # %%
 buffers = [ReplayBuffer(capacity=N_SMC_PARTICLES, dim=DIM)
@@ -189,28 +154,14 @@ print(f"buffers seeded: {[b.size for b in buffers]}")
 
 
 def normalize_log_weights(log_w):
-    """Shift a block to mean weight 1, so blocks written at different times are
-    commensurable — `.sample()` resamples across all of them jointly."""
+    """Shift a block of log-weights to mean weight 1."""
     total = logsumexp(log_w)
     return jnp.where(jnp.isfinite(total),
                      log_w - total + jnp.log(log_w.shape[0]),
                      jnp.zeros_like(log_w))
 
-
 # %% [markdown]
 # ## 5. Training
-#
-# ```
-# for each outer step:
-#     for k = 1 … M-1:                 # vmapped in the real notebooks
-#         backward SDE at β_k       →  (x₀, log w_path)
-#         systematic resample       →  approx. i.i.d. from π_{β_k}
-#         HMC rejuvenation
-#         IS bridge weights         →  log w_{k→k+1}
-#         buffer[k+1].add(...)
-#     for each inner step:
-#         mini-batch from every buffer, one Adam step on the joint TSM loss
-# ```
 
 # %%
 @jax.jit
@@ -222,7 +173,6 @@ def train_step(params, opt_state, x0_per_temp, t_per_temp, key):
     loss, grads = jax.value_and_grad(loss_fn)(params)
     updates, opt_state = optimizer.update(grads, opt_state)
     return optax.apply_updates(params, updates), opt_state, loss
-
 
 # %%
 for outer_step in range(NUM_OUTER_STEPS):
@@ -273,10 +223,7 @@ for outer_step in range(NUM_OUTER_STEPS):
 # %% [markdown]
 # ## 6. Evaluation
 #
-# Sample at β=1 with a finer grid than training used, then correct with the
-# path-space weights. The normalized ESS is the primary quality signal: the
-# learned score alone is `x_raw`, and the gap to `x_is` is what the importance
-# correction is doing.
+# Backward SDE at β=1 on a finer grid, corrected with the path-space weights.
 
 # %%
 key, subkey = jax.random.split(key)

@@ -216,8 +216,9 @@ class TestLennardJones:
         xs = 2.0 * jax.random.normal(jax.random.PRNGKey(2), (5, 13, 3))
         batched = target(xs)
         assert batched.shape == (5,)
-        assert jnp.allclose(batched, jax.vmap(target)(xs), rtol=1e-6)
-        assert jnp.allclose(batched, jax.jit(target)(xs), rtol=1e-6)
+        # float32 on GPU: jit may sum the pair terms in a different order (~1e-6 rel).
+        assert jnp.allclose(batched, jax.vmap(target)(xs), rtol=1e-5)
+        assert jnp.allclose(batched, jax.jit(target)(xs), rtol=1e-5)
 
     def test_rejects_wrong_shape(self):
         with pytest.raises(ValueError):

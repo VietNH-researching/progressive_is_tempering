@@ -21,17 +21,8 @@ float64 only (`jax.config.update("jax_enable_x64", True)` first):
   angles to the real line, torsions left as radian circles.
 * `angles_from_internal`: the biochemical (phi, psi) of an internal event.
 
-Provenance. This is a reduced copy of the code that produced the committed
-ALDP results: the force field and coordinate maps of `jaxmm` 0.2.0 and the
-`AlanineDipeptide` target of `jax-pdf` 0.4.0 (both MIT licensed), with every
-branch the ALDP problem does not use removed (cutoffs, periodic boxes, CMAP,
-Ryckaert-Bellemans torsions, restraints, the fixed-frame measure) and the
-input validation dropped. The arithmetic is unchanged, expression by
-expression and in the same order, and so is where each quantity is computed
-(eagerly, or inside the traced function): results are bit-identical to the
-original libraries, which `tests/test_alanine.py` does not check (it needs
-them installed) but the port was verified against before it was committed.
-Do not "simplify" an expression here without re-running that comparison.
+The arithmetic is order-sensitive: keep expressions and their order as they
+are, or results for a given seed change in the last bits.
 
 Atom order: the 22-atom openmmtools / PITA topology
   0 H1  1 CH3  2 H2  3 H3  4 C  5 O            (ACE)
@@ -90,7 +81,7 @@ N_ATOMS = 22
 
 #: A valid L-alanine structure (nm), used as the fallback event of invalid
 #: inputs and as the centre of the sampling coordinates. OpenMM Reference
-#: platform minimum of the openmmtools topology (jax-pdf's bundled asset).
+#: platform minimum of the openmmtools topology.
 REFERENCE_POSITIONS = np.array([
     [0.20000010000000001, 0.1, -1.3e-07],
     [0.20000010000000001, 0.209, 1e-08],
@@ -188,7 +179,7 @@ class ForceFieldParams(NamedTuple):
 
 
 def load_force_field(path) -> ForceFieldParams:
-    """Read a force field saved by `jaxmm.save_params` (NoCutoff, GBSA-OBC).
+    """Read a force-field parameter file (`.npz`; NoCutoff, GBSA-OBC).
 
     Only the terms ALDP in implicit solvent has are supported; a file with
     CMAP, RB torsions, restraints, a periodic box or a nonbonded cutoff is

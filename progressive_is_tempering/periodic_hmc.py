@@ -17,14 +17,9 @@ circles. This module is the kernel and SMC it uses:
   step-size adaptation at the new rung, `n_mcmc_steps` moves, and three local
   log Z estimates. Returns the particle block at every rung and the ladder.
 
-Provenance. A reduced copy of MPPT's HMC engine (`adaptation='stepsize'`,
-periodic indices) and `smc_sampler`, the code that produced the committed
-ALDP results. Unused branches (covariance / MEADS adaptation, MALA mode,
-adaptive move counts, runtime checks, callbacks) are removed; arithmetic, key
-splits and `lax.cond` structure are unchanged, so a seed gives bit-identical
-results to the original. As for `smc.py` and the kernels, seemingly equivalent
-rewrites change the random stream or the floating-point results: keep the
-expression order as it is.
+Order-sensitive: seemingly equivalent rewrites change the random stream or
+the floating-point results, so keep expression order and key splits as they
+are.
 
 Differences from the package's own `smc.py` / `hmc_kernel.py`: circles,
 identity preconditioning with scalar step-size search (`log_bisection`
