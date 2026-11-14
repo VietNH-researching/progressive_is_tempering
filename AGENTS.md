@@ -20,10 +20,13 @@ description (temperature ladder construction + data generation + data correction
 **External dependencies**:
 
 - None beyond the PyPI packages in `pyproject.toml`: every target energy
-  (GMM, DW4, Lennard-Jones) is implemented in `targets.py`.
+  (GMM, DW4, Lennard-Jones) is implemented in `targets.py`, and alanine
+  dipeptide (force field, internal and sampling coordinates) in `alanine.py`.
 - The SMC ladder construction and the MCMC kernels are implemented in-package
-  (`smc.py`, `mala_kernel.py`, `hmc_kernel.py`); there is no other algorithmic
-  dependency.
+  (`smc.py`, `mala_kernel.py`, `hmc_kernel.py`; for ALDP, `periodic_hmc.py`);
+  there is no other algorithmic dependency. `alanine.py` and `periodic_hmc.py`
+  are reduced copies of `jaxmm` / `jax-pdf` and MPPT, the libraries that
+  produced the committed ALDP results (see their module docstrings).
 - `utils/metrics.py` needs SciPy and POT (both in `pyproject.toml`). The
   notebooks additionally need matplotlib, which is not a package dependency.
 
@@ -49,8 +52,10 @@ A single notebook run with `RUN_SEED=N` set writes to `results/<target>/seedN/`;
 without it, to `results/<target>/`.
 
 The DW4, LJ13 and LJ55 notebooks read `data/test_split_DW4.npy`,
-`data/test_split_LJ13-1000.npy` and `data/test_split_LJ55-1000-part1.npy`, which are not tracked; fetch them with
-`bash data/redownload.sh`.
+`data/test_split_LJ13-1000.npy` and `data/test_split_LJ55-1000-part1.npy`, and the ALDP
+notebook `data/test_split_AL22-10000_T300.npy` and `data/val_split_AL22-10000_T300.npy`
+(PITA's 300 K MD splits), which are not tracked; fetch them with
+`bash data/redownload.sh`. PITA's ALDP force field, `data/aldp_ff14sb_obc1.npz`, is tracked.
 
 The package is installed editable and imported as `progressive_is_tempering`; there are
 no `sys.path` hacks.
@@ -67,11 +72,13 @@ progressive_is_tempering/          # repo root
 │   ├── __init__.py                # re-exports targets, sde, resampling, sampler, mala, buffer, loss, score_network
 │   ├── sde.py                     # OU forward SDE: transition density + forward sampler
 │   ├── targets.py                 # GMMTarget + DW4 / LennardJones particle energies
+│   ├── alanine.py                 # ALDP: force field (ff14SB + OBC1), Z-matrix, internal/sampling coordinates, target
 │   ├── resampling.py              # systematic resampling + normalized ESS
 │   ├── mala.py                    # isotropic MALA step + step-size calibration (not used by the notebooks)
 │   ├── mala_kernel.py             # PTProblem + covariance-preconditioned HMC kernel, full refresh ("mala")
 │   ├── hmc_kernel.py              # the same kernel with partial refresh ("hmc", the notebooks' default)
 │   ├── smc.py                     # adaptive-temperature SMC sampler (ladder + per-rung kernel params)
+│   ├── periodic_hmc.py            # HMC with radian circles (step-size adaptation) + its SMC sampler (ALDP)
 │   ├── rejuvenate.py              # HMC rejuvenation with the SMC-adapted kernel
 │   ├── sampler.py                 # backward SDE with path-space log-weights
 │   ├── buffer.py                  # per-temperature FIFO replay buffers
@@ -81,11 +88,12 @@ progressive_is_tempering/          # repo root
 │   │   ├── embedding.py           # sinusoidal time + beta embeddings
 │   │   ├── mlp.py                 # MLP and ResMLP Flax modules
 │   │   ├── score_network.py       # ScoreNetwork: β-conditioned excess-score model
-│   │   └── egnn_jax.py            # EGNN backbone for equivariant (molecular) targets
+│   │   ├── egnn_jax.py            # EGNN backbone for equivariant (molecular) targets
+│   │   └── dit.py                 # PITA's DIT3D transformer (ALDP score network)
 │   └── utils/
 │       ├── __init__.py            # shared utilities (no imports from core package)
 │       ├── smc_diagnostics.py     # SMC seed-quality + ancestral-degeneracy diagnostics
-│       ├── metrics.py             # reported metrics: Distance-W2, Energy-W2, Geometric-W2
+│       ├── metrics.py             # reported metrics: Distance-W2, Energy-W2, Geometric-W2; ALDP: Rama-KL, Energy-W1/W2, T-W2
 │       └── report.py              # writes results/<target>/<run_id>/metrics.json
 ├── notebooks/
 │   ├── gmm/                       # GMM experiment (gmm.py + gmm.ipynb)
@@ -93,6 +101,7 @@ progressive_is_tempering/          # repo root
 │   ├── dw4/                       # DW4 molecule experiment (dw4.py + dw4.ipynb)
 │   ├── lj13/                      # LJ13 cluster experiment (lj13.py + lj13.ipynb)
 │   ├── lj55/                      # LJ55 cluster experiment (lj55.py + lj55.ipynb)
+│   ├── aldp/                      # alanine dipeptide experiment (aldp.py + aldp.ipynb)
 │   └── templates/minimal.py       # minimal training loop template
 ├── tests/                         # pytest suite
 │   ├── test_sde.py
@@ -107,13 +116,17 @@ progressive_is_tempering/          # repo root
 │   ├── test_loss.py
 │   ├── test_targets.py
 │   ├── test_score_network.py
+│   ├── test_alanine.py
+│   ├── test_periodic_hmc.py
+│   ├── test_dit.py
 │   ├── test_smc_diagnostics.py
 │   ├── test_metrics.py
 │   └── test_report.py
 ├── scripts/
 │   └── run_seeds.sh               # runs seeds 0, 1, 2 of every target (produced the reported results)
 ├── data/                          # reference data for sampling benchmarks
-│   └── redownload.sh              # fetches the DEM test splits (DW4, LJ13, LJ55); none are tracked
+│   ├── redownload.sh              # fetches the DEM test splits (DW4, LJ13, LJ55) and PITA's ALDP MD splits; none are tracked
+│   └── aldp_ff14sb_obc1.npz       # PITA's ALDP force field (tracked)
 └── results/                       # per target[/seedN]: checkpoint.pkl, log.txt, figures/ (gitignored), <run_id>/metrics.json (tracked)
 ```
 
@@ -134,6 +147,7 @@ progressive_is_tempering.<module>   (notebooks import each module directly;
         ├──► rejuvenate ──► mala_kernel, hmc_kernel
         ├──► loss
         ├──► targets
+        ├──► alanine, periodic_hmc, net.dit    (ALDP)
         ├──► resampling
         ├──► sde
         └──► net.score_network ──► net.embedding
@@ -142,9 +156,9 @@ progressive_is_tempering.<module>   (notebooks import each module directly;
              hmc_kernel        ──► mala_kernel
 ```
 
-Leaf modules (`sde`, `targets`, `resampling`, `mala`, `mala_kernel`, `loss`, `net.embedding`,
-`net.mlp`, `net.egnn_jax`) import only from JAX/Flax — never from each other or
-from higher layers.
+Leaf modules (`sde`, `targets`, `alanine`, `periodic_hmc`, `resampling`, `mala`, `mala_kernel`,
+`loss`, `net.embedding`, `net.mlp`, `net.egnn_jax`, `net.dit`) import only from JAX/Flax — never
+from each other or from higher layers.
 
 **Key rule**: `progressive_is_tempering.utils` never imports from the core package
 (one-directional layering).
@@ -195,6 +209,17 @@ Run the backward SDE at `β=1` with `n_sde_steps_eval >> n_sde_steps_train` (e.g
 | `sde_is` | the same particles, systematically resampled on `log_w_path` |
 | `buffer` | `buffer[M]`, resampled on its stored weights |
 
+ALDP is scored with the metrics of PITA's Table 2 instead (`ramachandran_kl`, `wasserstein_1d_exact` for Energy-W1/W2 in kT, `torus_w2`) plus Distance-W2, against PITA's 300 K MD test split; its validation split gives the noise floor, logged with the results.
+
+**ALDP (`notebooks/aldp/aldp.py`) differs from the scheme above**:
+
+- The annealing path is defined in 60 *sampling coordinates* `z` (`alanine.SamplingCoordinates` over `alanine.aldp_zmatrix`): `ρ = N(0, I_42) × Unif[-π, π)^18` (torsions are circles), target = the Boltzmann factor pulled back to `z`. SMC (`periodic_hmc.smc_sampler`) and rejuvenation (`y → z`, `periodic_hmc` HMC moves at the rung, `z → y` with a fresh uniform rotation) run in `z`; the network, backward SDE and buffers in Cartesian `y = x / S`, zero CoM. The per-rung HMC step size is re-adapted on each rung's SMC block after SMC (`calibrate`), not returned by SMC.
+- Because `ρ ≠ N(0, I)`, the network learns the excess score against `N(0, I)`; its TSM target is `e^{-t}(∇log π_β(y_0) + y_0)` (not 0 at `β = 0`; buffer 0 stores `∇log ρ`). Rows are `[y_0 | ∇_y log π_β(y_0)]`, not `∇E`.
+- Loss: DSM at every `t` plus `0.01 ×` TSM for `t < 0.0184`, both weighted by `σ_t²`; `t` log-uniform on `[t_min, T]`; random rotation augmentation; network = PITA's DIT3D (`net/dit.py`).
+- ESS gate: rung `k`'s block goes to buffer `k+1` only if path ESS × K ≥ `ess_gate` (10.24 = 1% of K). Rungs run with `jax.lax.map` in chunks of `rung_chunk`; the inner loop is one compiled `lax.scan`.
+- The quick evaluation draws from the training key stream; the final evaluation runs on its own key `jax.random.key(eval_seed)`, resamples `sde_is` with NumPy's systematic resampling (seed 0), and draws `buffer` with the training run's key schedule — exactly what produced the committed records.
+- The training SDE computes its step coefficients `λ = e^{-Δt}`, `1 − λ`, `1 − e^{-2Δt}` in float32, as the committed runs did; near `t_min = 1e-5` they lose most of their digits (≈20% error on the last of 1000 steps). The final evaluation (`backward_sde_eval`) uses `-expm1(-Δt)` / `-expm1(-2Δt)`. Keep the training path as it is unless the runs are redone.
+
 ---
 
 ## Key patterns
@@ -243,11 +268,11 @@ Run the backward SDE at `β=1` with `n_sde_steps_eval >> n_sde_steps_train` (e.g
 
 **`project_invariant=True` only for projection-invariant energies** — it tells `rejuvenate` that `logpdf_final_target` is unchanged by `project_fn`, so the re-projection after each move skips re-evaluating it. True for DW4 (pair distances, `trap_scale=0`); false for LJ13 and LJ55, whose harmonic trap depends on the CoM.
 
-**Reproducibility needs deterministic GPU ops** — every notebook (GMM16, GMM50, DW4, LJ13, LJ55) sets `--xla_gpu_deterministic_ops=true` in `XLA_FLAGS` before importing JAX. Without it the same seed gives different results in different processes: XLA's GPU reductions and scatters may sum in a different order, and SMC's adaptive ladder turns last-bit differences into a different ladder. With it, a seed reproduces the committed `results/{gmm,gmm50,dw4}/seedN/*/metrics.json` exactly on the same hardware and software (produced on NVIDIA RTX 4500 Ada GPUs with JAX 0.9.0.1, whichever GPU index and with or without `scripts/run_seeds.sh`); other GPU models or JAX/CUDA versions may still differ in the last bits. LJ13's `results/lj13/seedN/` were produced with the flag, but a rerun has not yet confirmed them bit for bit. LJ55's `results/lj55/seedN/` were produced with the flag by the study script `notebooks/lj55/lj55.py` was ported from (same numerics and key order; checked against it on CPU), not by the notebook itself, and have not been rerun.
+**Reproducibility needs deterministic GPU ops** — every notebook (GMM16, GMM50, DW4, LJ13, LJ55, ALDP) sets `--xla_gpu_deterministic_ops=true` in `XLA_FLAGS` before importing JAX. Without it the same seed gives different results in different processes: XLA's GPU reductions and scatters may sum in a different order, and SMC's adaptive ladder turns last-bit differences into a different ladder. With it, a seed reproduces the committed `results/{gmm,gmm50,dw4}/seedN/*/metrics.json` exactly on the same hardware and software (produced on NVIDIA RTX 4500 Ada GPUs with JAX 0.9.0.1, whichever GPU index and with or without `scripts/run_seeds.sh`); other GPU models or JAX/CUDA versions may still differ in the last bits. LJ13's `results/lj13/seedN/` were produced with the flag, but a rerun has not yet confirmed them bit for bit. LJ55's `results/lj55/seedN/` were produced with the flag by the study script `notebooks/lj55/lj55.py` was ported from (same numerics and key order; checked against it on CPU), not by the notebook itself, and have not been rerun. ALDP's `results/aldp/seedN/` were trained, with the flag, by the study script `notebooks/aldp/aldp.py` was ported from, on the jaxmm / jax-pdf / MPPT libraries that `alanine.py` and `periodic_hmc.py` reduce; the port was checked bit for bit against them on CPU (energies, gradients, coordinate maps, SMC ladder, calibration, rejuvenation, and 11 outer steps of a small configuration end to end) and on GPU (the same run with the full 4096-particle SMC). The notebook's final evaluation, run from the converted checkpoints with `resume = True`, reproduced the evaluation samples behind the committed records bit for bit; the training itself has not been rerun by the notebook.
 
-**Two kernels, selected by name** — `smc_sampler(..., kernel=...)` and `rejuvenate(..., kernel=...)` take `"hmc"` (`hmc_kernel`: one leapfrog step, partial velocity refresh 0.07 so momentum persists across moves, acceptance `[0.8, 0.95]`) or `"mala"` (`mala_kernel`: the same step with full refresh, acceptance `[0.4, 0.65]`; the package default). All five notebooks set `mcmc_kernel = "hmc"` in their training config. Pass `rejuvenate` the same `kernel` SMC ran with: the adapted `MALAParameters` carry that kernel's refresh rate and step size. `hmc_kernel` differs from `mala_kernel` only in `adapt_params` (its `move` is `mala_kernel`'s), and with `project_fn` set, `rejuvenate` carries the velocity across each re-projection for `"hmc"` instead of redrawing it.
+**Two kernels, selected by name** — `smc_sampler(..., kernel=...)` and `rejuvenate(..., kernel=...)` take `"hmc"` (`hmc_kernel`: one leapfrog step, partial velocity refresh 0.07 so momentum persists across moves, acceptance `[0.8, 0.95]`) or `"mala"` (`mala_kernel`: the same step with full refresh, acceptance `[0.4, 0.65]`; the package default). The GMM16, GMM50, DW4, LJ13 and LJ55 notebooks set `mcmc_kernel = "hmc"` in their training config (ALDP uses `periodic_hmc` instead: the same partial refresh 0.07, identity preconditioner, step size only, radian circles). Pass `rejuvenate` the same `kernel` SMC ran with: the adapted `MALAParameters` carry that kernel's refresh rate and step size. `hmc_kernel` differs from `mala_kernel` only in `adapt_params` (its `move` is `mala_kernel`'s), and with `project_fn` set, `rejuvenate` carries the velocity across each re-projection for `"hmc"` instead of redrawing it.
 
-**`smc.py` / `mala_kernel.py` / `hmc_kernel.py` are order-sensitive** — keep arithmetic expression order, key splits, and `lax.cond` structure as they are when editing. Seemingly equivalent rewrites (merging the two half velocity steps, dropping the `t_idx == 0` branch in `move`, reusing `resampling.systematic_resample` in SMC) change the floating-point results or the random stream, so the same seed gives different results.
+**`smc.py` / `mala_kernel.py` / `hmc_kernel.py` (and `periodic_hmc.py`, `alanine.py`) are order-sensitive** — keep arithmetic expression order, key splits, and `lax.cond` structure as they are when editing. Seemingly equivalent rewrites (merging the two half velocity steps, dropping the `t_idx == 0` branch in `move`, reusing `resampling.systematic_resample` in SMC) change the floating-point results or the random stream, so the same seed gives different results.
 
 ---
 

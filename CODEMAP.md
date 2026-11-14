@@ -17,6 +17,8 @@ progressive_is_tempering/          # repo root
 │   ├── __init__.py
 │   ├── sde.py
 │   ├── targets.py
+│   ├── alanine.py                 # ALDP force field, coordinates, target
+│   ├── periodic_hmc.py            # HMC with radian circles + its SMC (ALDP)
 │   ├── resampling.py
 │   ├── mala.py
 │   ├── mala_kernel.py
@@ -31,11 +33,12 @@ progressive_is_tempering/          # repo root
 │   │   ├── embedding.py
 │   │   ├── mlp.py
 │   │   ├── score_network.py
-│   │   └── egnn_jax.py
+│   │   ├── egnn_jax.py
+│   │   └── dit.py                 # PITA's DIT3D (ALDP)
 │   └── utils/
 │       ├── __init__.py
 │       ├── smc_diagnostics.py     # SMC seed-quality / degeneracy diagnostics
-│       ├── metrics.py             # reported metrics: Distance-W2, Energy-W2, Geometric-W2
+│       ├── metrics.py             # reported metrics: Distance-W2, Energy-W2, Geometric-W2; Rama-KL, Energy-W1/W2, T-W2 (ALDP)
 │       └── report.py              # writes results/<target>/<run_id>/metrics.json
 │
 ├── notebooks/
@@ -54,13 +57,17 @@ progressive_is_tempering/          # repo root
 │   ├── lj55/                      # LJ55 cluster experiment
 │   │   ├── lj55.py
 │   │   └── lj55.ipynb
+│   ├── aldp/                      # alanine dipeptide experiment (PITA's target)
+│   │   ├── aldp.py
+│   │   └── aldp.ipynb
 │   └── templates/minimal.py       # minimal training loop template
 │
 ├── tests/                         # pytest suite
 ├── scripts/
 │   └── run_seeds.sh               # runs seeds 0, 1, 2 of every target (produced the reported results)
 ├── data/                          # reference data for sampling benchmarks
-│   └── redownload.sh              # fetches the DEM test splits (DW4, LJ13, LJ55); none are tracked
+│   ├── redownload.sh              # fetches the DEM test splits (DW4, LJ13, LJ55) and PITA's ALDP MD splits; none are tracked
+│   └── aldp_ff14sb_obc1.npz       # PITA's ALDP force field (tracked)
 └── results/                       # per target[/seedN]: checkpoint.pkl, log.txt, figures/ (gitignored), <run_id>/metrics.json (tracked)
 ```
 
@@ -83,6 +90,7 @@ progressive_is_tempering.<module>   (notebooks import each module directly;
         ├──► rejuvenate   ──► mala_kernel, hmc_kernel
         ├──► loss
         ├──► targets
+        ├──► alanine, periodic_hmc, net.dit    (ALDP; leaves)
         ├──► resampling
         ├──► sde
         └──► net.score_network ──► net.embedding
@@ -125,6 +133,35 @@ Unnormalized target distributions. A target exposes `energy(x)`, `log_prob(x)`, 
 | `LennardJones(n_particles, spatial_dim, epsilon, rm, trap_scale, trap_mode, beta)` | Lennard-Jones 12-6 cluster with harmonic trap; callable, `x: (..., n, s)` → unnormalized log-density |
 
 `DW4` and `LennardJones` are bare energies, not `GMMTarget`-style targets: each of those notebooks wraps one into `energy(x)` on flat inputs and defines the zero-CoM reference and projection itself.
+
+---
+
+### `alanine.py`
+
+Alanine dipeptide in pure JAX, float64 only (enable x64 first). A reduced copy of `jaxmm` 0.2.0 (force field, coordinate maps) and `jax-pdf` 0.4.0 (`AlanineDipeptide`), bit-identical to them; keep expression order as it is.
+
+| Symbol | Description |
+|---|---|
+| `load_force_field(path)` | Read a `jaxmm.save_params` file (bonds, angles, periodic torsions, LJ + Coulomb with exclusions / 1-4 exceptions, GBSA-OBC; no cutoff) → `ForceFieldParams`. `data/aldp_ff14sb_obc1.npz` is PITA's force field (ff14SB + OBC1) |
+| `total_energy(x, params)`, `log_boltzmann(x, params, T)` | `U(x)` in kJ/mol, `-U/k_BT`, for `x: (22, 3)` nm |
+| `AlanineDipeptide(params, temperature)` | Callable `x: (..., 22, 3)` → `-U/k_BT`, `-inf` outside the L-alanine sector |
+| `aldp_zmatrix()`, `InternalCoordinates` | Backbone-rooted Z-matrix; packed `q = [21 bonds, 20 angles, 19 torsions]`; `to_internal`, `to_cartesian`, `log_volume` (rigid motions integrated out), `pullback` of a Cartesian density |
+| `AlanineDipeptideInternal(cartesian)` | The same target as a density of `q` (physical measure) |
+| `SamplingCoordinates(reference, scale, lower, upper, periodic_indices)` | Log / logit maps of bounded coordinates to ℝ, circles unchanged; `to_physical`, `to_sampling`, `log_abs_det_jacobian`, `pullback` |
+| `angles_from_internal(q)` | Biochemical (φ, ψ) from torsions 12 and 5 (NumPy) |
+
+---
+
+### `periodic_hmc.py`
+
+HMC with radian-circle coordinates and the adaptive SMC that builds its ladder (the ALDP notebook's MCMC, in sampling coordinates). A reduced copy of MPPT's HMC engine (`adaptation='stepsize'`) and `smc_sampler`, bit-identical to it; order-sensitive like `smc.py`.
+
+| Symbol | Description |
+|---|---|
+| `PTProblem(rvs_ref, logpdf_ref, logpdf_final_target, exact_ref=True)` | The geometric path |
+| `hmc_kernel(problem, t, t_idx, refresh_rate, periodic_indices)`, `make_engine(...)` | Kernel at one rung: leapfrog, Metropolis on (position, velocity), partial refresh; circles wrapped to `[-π, π)`; `adapt_params` = identity preconditioner + step size by log-bisection to acceptance `[0.8, 0.95]`; rung 0 draws fresh from the reference |
+| `batch_init_extend`, `batch_move`, `repeated_batch_move`, `batch_reset_temperature` | Population operations (vmap / `fori_loop`) |
+| `smc_sampler(key, problem, n_particles, engine, n_mcmc_steps, local_ess_ratio, verbose, keep_all_states)` | Adaptive ladder (64-step ESS bisection). Returns `(positions (M+1, N, d) or final particles, logZ dict, temperatures list)` — no kernel parameters (the notebook re-adapts them per rung) |
 
 ---
 
@@ -288,6 +325,12 @@ Equivariant Graph Neural Network backbone for particle-system targets. Used in p
 
 ---
 
+### `net/dit.py`
+
+`DIT3D`: Flax port of PITA's ALDP transformer (one token per atom, adaLN conditioning on noise level and β, 6 blocks with rotary embeddings, zero-init output; 3,179,267 parameters). Batched: `(c_noise (B,), x (B, 3n), β (B,))` → `(B, 3n)`. Not equivariant: the ALDP notebook uses rotation augmentation. Module names are the keys of the checkpointed parameters.
+
+---
+
 ### `utils/smc_diagnostics.py`
 
 SMC seed-quality diagnostics, shared by every notebook. Catches two failure modes of the top-rung SMC block, which are not the same thing.
@@ -320,6 +363,9 @@ The three metrics reported for the method. Each notebook's final evaluation scor
 | `geometric_w2(x_test, x_ref, n_particles, spatial_dim, max_n, seed, n_workers)` | Geometric-W2 (particle targets only): exact OT with ground cost "assignment on unaligned coordinates, then Procrustes over O(s)", squared, outer square root |
 | `wasserstein2_1d(a, b)` | Sorting-based 1-D W2; exact at equal counts, 1000 midpoint quantiles otherwise; drops non-finite entries |
 | `geometric_d2_matrix(...)` | The `(n, m)` squared ground-cost matrix behind `geometric_w2` |
+| `ramachandran_kl(angles_ref, angles, bins=100, eps=1e-10)` | ALDP Rama-KL: KL(reference ‖ sample) of 2-D (φ, ψ) histograms (our definition; compare with the MD floor) |
+| `wasserstein_1d_exact(ref, test, p)` | Exact 1-D W1 / W2 by POT `emd2_1d` (ALDP Energy-W1 / W2, in kT) |
+| `torus_w2(angles, angles_ref)` | ALDP T-W2: exact OT on the (φ, ψ) torus, wrapped squared distances |
 
 Geometric-W2 needs `n × m` alignments (10⁸ at 10k × 10k), so `geometric_w2` runs them on a spawn-context process pool inside a **fresh subprocess**: spawn workers re-import the parent's `__main__`, which for a notebook run as a script would re-execute the whole notebook, and forking a process with JAX loaded can deadlock. The one-shot alignment is an upper bound on the true ground distance and is asymmetric; that is the published definition, kept deliberately. Needs scipy and POT.
 

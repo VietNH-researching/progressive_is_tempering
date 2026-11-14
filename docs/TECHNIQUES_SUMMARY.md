@@ -359,6 +359,30 @@ kernel, which is not aware of it: the SMC particle stack is projected once
 before use (Phase 1), and rejuvenation re-projects after every move (Phase 2,
 Step 1c).
 
+### Alanine dipeptide: MCMC in internal coordinates
+
+The ALDP notebook (`notebooks/aldp/aldp.py`) keeps the scheme but splits the
+coordinates. Cartesian HMC cannot cross the torsional barriers of a molecule, so
+the **path and the MCMC live in 60 sampling coordinates** $z$ (bonds and angles
+mapped to $\mathbb R$, torsions as radian circles): $\rho_Z=\mathcal N(0,I_{42})
+\times\mathrm{Unif}[-\pi,\pi)^{18}$, and the target is the Boltzmann factor pulled
+back to $z$. The geometric path is coordinate-free (a Jacobian $J$ enters as
+$J^{1-\beta}J^{\beta}=J$), so the same $\pi_\beta$ has a Cartesian density
+$\log\pi_{\beta,X}=(1-\beta)\log\rho_X+\beta\log p_X$ with
+$\log\rho_X(x)=\log\rho_Z(z(x))-\log|\partial q/\partial z|-\log\mathrm{vol}(q(x))$,
+and the **network, backward SDE and buffers live in Cartesian coordinates**
+(zero CoM, scaled by $S$). SMC and rejuvenation run in $z$ (HMC with circles,
+`periodic_hmc.py`); a rejuvenated block is mapped back with a fresh uniform
+rotation, an exact Gibbs step since $\pi_{\beta,X}$ is rotation-invariant.
+
+Because $\rho\ne\gamma=\mathcal N(0,I)$, the network learns the excess score
+against $\gamma$, $s(y_t)=e^{-t}\,\mathbb E[\nabla\log\pi_\beta(Y_0)+Y_0\mid Y_t=y_t]$,
+which is not zero at $\beta=0$. Two further changes: the loss adds denoising
+score matching at every $t$ to a small TSM term at small $t$ (the Cartesian TSM
+target of a stiff molecule is too noisy on its own), and a bridge block enters
+its buffer only if the path ESS of its backward SDE run exceeds a threshold
+(`ess_gate`). The score network is PITA's DiT with rotation augmentation.
+
 ---
 
 ## Phase 1: Initialization

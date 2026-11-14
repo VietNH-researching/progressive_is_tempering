@@ -138,6 +138,7 @@ A target needs a scalar energy `E(x)` and the `PTProblem` triple (`rvs_ref`, `lo
    plus a `make_<name>_target(...)` factory, both listed in `targets.__all__`, and tests in `tests/test_targets.py` (shape checks, `grad_energy` against finite differences, `log_prob` consistent with `energy`).
 
 - **Notebook-local target** (as DW4, LJ13 and LJ55): wrap a bare energy (e.g. `targets.DW4`, `targets.LennardJones`) inside the experiment notebook, together with anything specific to it — for translation-invariant particle systems, the zero-CoM projection applied to reference draws, the SMC stack, forward noising, the backward SDE and `rejuvenate(..., project_fn=...)`.
+  ALDP does the same with `alanine.AlanineDipeptide` (force field and coordinate maps in `alanine.py`): its notebook defines the annealing path in internal coordinates, the Cartesian maps and the zero-CoM projection.
 
 ---
 

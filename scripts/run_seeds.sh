@@ -21,7 +21,7 @@
 #   kill -TERM -- -$(cat results/sweep.pgid)
 #
 # Overrides (environment variables):
-#   TARGETS="gmm dw4 gmm50 lj13 lj55"   targets, in run order
+#   TARGETS="gmm dw4 gmm50 lj13 lj55 aldp"   targets, in run order
 #   SEEDS="0 1 2"                  seeds per target
 #   GPU=0                          physical GPU index (CUDA_VISIBLE_DEVICES)
 #   PYTHON=python                  interpreter with progressive_is_tempering installed
@@ -32,7 +32,7 @@
 set -uo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-TARGETS="${TARGETS:-gmm dw4 gmm50 lj13 lj55}"
+TARGETS="${TARGETS:-gmm dw4 gmm50 lj13 lj55 aldp}"
 SEEDS="${SEEDS:-0 1 2}"
 GPU="${GPU:-0}"
 PYTHON="${PYTHON:-python}"

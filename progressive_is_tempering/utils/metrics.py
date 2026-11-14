@@ -13,6 +13,15 @@ These are the three metrics reported for the method:
     approximated one-shot (assignment first, then Procrustes). Particle targets
     only: it is undefined for GMM, which has no particle symmetry.
 
+Alanine dipeptide is scored with the metrics of PITA's Table 2 instead (no
+particle permutation symmetry, so Geometric-W2 does not apply):
+
+  - `ramachandran_kl` — KL(reference || sample) between 2-D (phi, psi)
+    histograms (Rama-KL).
+  - `wasserstein_1d_exact` — exact 1-D W1 / W2 between energy distributions
+    (Energy-W1, Energy-W2, in kT).
+  - `torus_w2` — exact 2-Wasserstein on the (phi, psi) torus (T-W2).
+
 NumPy / SciPy / POT rather than JAX: these run once, at the end of a run, on
 finished samples pulled off the device. Never imports from the core package
 (one-directional layering).
@@ -37,6 +46,9 @@ __all__ = [
     "energy_w2",
     "geometric_d2_matrix",
     "geometric_w2",
+    "ramachandran_kl",
+    "wasserstein_1d_exact",
+    "torus_w2",
 ]
 
 
@@ -256,3 +268,56 @@ def geometric_w2(
             check=True, env=env,
         )
         return float(np.load(out_path))
+
+
+# ---------------------------------------------------------------------------
+# Alanine dipeptide: Rama-KL, Energy-W1 / W2 (exact), T-W2
+# ---------------------------------------------------------------------------
+
+def ramachandran_kl(angles_ref, angles, bins: int = 100, eps: float = 1e-10) -> float:
+    """Rama-KL: KL(P_ref || P_sample) of 2-D (phi, psi) histograms.
+
+    `angles_ref` (m, 2) and `angles` (n, 2) in radians. `bins` x `bins` cells
+    on [-pi, pi)^2; `eps` is added to every cell count before normalising.
+    PITA reports this metric without releasing its definition; this is ours,
+    so its absolute value depends on `bins`, `eps` and the sample sizes:
+    compare it against the same statistic between two reference sets (the MD
+    floor), not against published numbers.
+    """
+    rng = [[-np.pi, np.pi], [-np.pi, np.pi]]
+    angles_ref, angles = np.asarray(angles_ref), np.asarray(angles)
+    p = np.histogram2d(angles_ref[:, 0], angles_ref[:, 1], bins=bins, range=rng)[0] + eps
+    q = np.histogram2d(angles[:, 0], angles[:, 1], bins=bins, range=rng)[0] + eps
+    p, q = p / p.sum(), q / q.sum()
+    return float(np.sum(p * np.log(p / q)))
+
+
+def wasserstein_1d_exact(ref, test, p: int) -> float:
+    """Exact 1-D W_p (p = 1 or 2) between two empirical distributions, by POT's
+    `emd2_1d` (sorting), uniform weights, any sample sizes. PITA's Energy-W1
+    and Energy-W2 (W2 = square root of the squared-cost transport)."""
+    import ot
+
+    ref = np.asarray(ref, dtype=np.float64).reshape(-1)
+    test = np.asarray(test, dtype=np.float64).reshape(-1)
+    if p == 1:
+        return float(ot.emd2_1d(ref, test, metric="euclidean"))
+    if p == 2:
+        return float(np.sqrt(ot.emd2_1d(ref, test)))
+    raise ValueError(f"p must be 1 or 2 (got {p!r})")
+
+
+def torus_w2(angles, angles_ref) -> float:
+    """T-W2: exact 2-Wasserstein between (phi, psi) samples on the torus.
+
+    Ground cost: sum over the two angles of the squared wrapped difference
+    `min(|d|, 2 pi - |d|)^2`; exact optimal transport (POT `emd2`, uniform
+    marginals), outer square root. Memory is n x m float64: 0.8 GB at 10k x 10k.
+    """
+    import ot
+
+    a, b = np.asarray(angles, dtype=np.float64), np.asarray(angles_ref, dtype=np.float64)
+    d = np.abs(a[:, None] - b[None])
+    return float(np.sqrt(ot.emd2(ot.unif(len(a)), ot.unif(len(b)),
+                                 (np.minimum(d, 2 * np.pi - d) ** 2).sum(-1),
+                                 numItermax=int(1e8))))

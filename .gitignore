@@ -17,8 +17,10 @@ __pycache__/
 /results/sweep.pgid
 
 # Data: downloaded files are fetched by redownload.sh; keep only the script
+# and the ALDP force field (PITA's, small)
 /data/*
 !/data/redownload.sh
+!/data/aldp_ff14sb_obc1.npz
 
 # Local tooling / scratch
 .claude/
@@ -36,3 +38,6 @@ commit_message.txt
 # for things to implement.
 /studying/
 /references/
+
+# Study notes kept out of the repo
+/docs/MIXED_LOSS.md

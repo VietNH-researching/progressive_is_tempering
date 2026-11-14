@@ -1,4 +1,5 @@
-"""Tests for progressive_is_tempering.utils.metrics (Distance/Energy/Geometric-W2)."""
+"""Tests for progressive_is_tempering.utils.metrics (Distance/Energy/Geometric-W2,
+and the ALDP metrics Rama-KL, exact 1-D W1/W2, T-W2)."""
 
 import numpy as np
 import pytest
@@ -9,7 +10,10 @@ from progressive_is_tempering.utils.metrics import (
     energy_w2,
     geometric_d2_matrix,
     geometric_w2,
+    ramachandran_kl,
+    torus_w2,
     wasserstein2_1d,
+    wasserstein_1d_exact,
 )
 
 
@@ -146,3 +150,39 @@ def test_geometric_w2_parallel_matches_serial():
     serial = geometric_w2(xt, xr, 4, 2, n_workers=1)
     parallel = geometric_w2(xt, xr, 4, 2, n_workers=2)
     assert parallel == pytest.approx(serial, rel=1e-12)
+
+
+# ---------------------------------------------------------------------------
+# ALDP metrics
+# ---------------------------------------------------------------------------
+
+def test_ramachandran_kl_zero_on_identical_and_positive_otherwise():
+    rng = np.random.default_rng(0)
+    a = rng.uniform(-np.pi, np.pi, size=(5000, 2))
+    assert ramachandran_kl(a, a) == pytest.approx(0.0, abs=1e-12)
+    b = np.clip(rng.normal(0.0, 0.5, size=(5000, 2)), -np.pi, np.pi - 1e-9)
+    assert ramachandran_kl(a, b) > 1.0
+    # sample missing a reference cell -> large (eps-floored) divergence
+    assert ramachandran_kl(a, b) > ramachandran_kl(a, a[:2500])
+
+
+def test_wasserstein_1d_exact_shift():
+    rng = np.random.default_rng(1)
+    a = rng.normal(size=3000)
+    b = rng.normal(size=1000)
+    assert wasserstein_1d_exact(a, a + 0.7, 1) == pytest.approx(0.7, rel=1e-9)
+    assert wasserstein_1d_exact(a, a + 0.7, 2) == pytest.approx(0.7, rel=1e-9)
+    # unequal sizes: W1 <= W2, both symmetric
+    w1, w2 = wasserstein_1d_exact(a, b, 1), wasserstein_1d_exact(a, b, 2)
+    assert 0 < w1 <= w2
+    assert wasserstein_1d_exact(b, a, 2) == pytest.approx(w2, rel=1e-9)
+    with pytest.raises(ValueError):
+        wasserstein_1d_exact(a, b, 3)
+
+
+def test_torus_w2_wraps_around():
+    a = np.array([[np.pi - 0.01, 0.0], [0.0, -np.pi + 0.02]])
+    b = np.array([[-np.pi + 0.01, 0.0], [0.0, np.pi - 0.02]])
+    # nearest images are 0.02 and 0.04 apart across the seam, not ~2 pi
+    assert torus_w2(a, b) == pytest.approx(np.sqrt((0.02 ** 2 + 0.04 ** 2) / 2), rel=1e-9)
+    assert torus_w2(a, a) == pytest.approx(0.0, abs=1e-12)
