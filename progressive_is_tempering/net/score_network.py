@@ -1,7 +1,7 @@
 """
 β-conditioned excess-score network for MLP-based problems.
 
-Architecture (IMPLEMENTATION_MLP.md §Score Network: Input Wiring):
+Architecture:
 
     t_embed    = time_embedding(t,    freq_min=1.0, freq_max=10.0, dim=time_embedding_dim)
     beta_embed = time_embedding(beta, freq_min=0.5, freq_max=5.0,  dim=beta_embedding_dim)

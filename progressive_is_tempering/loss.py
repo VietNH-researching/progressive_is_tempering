@@ -1,7 +1,7 @@
 """
 DDPM regression loss for the β-conditioned excess score network.
 
-From TECHNIQUES_SUMMARY.md §8 (DDPM Regression Target):
+From docs/TECHNIQUES_SUMMARY.md §4 (Training):
 
     φ(x_0, t, β) = λ_t · β · (x_0 - ∇E(x_0))
 
@@ -11,7 +11,7 @@ The training objective is the mean squared error between the score network
 output s_θ(x_t, t, β) and the regression target φ, averaged over temperature
 levels and mini-batches.
 
-From IMPLEMENTATION_MLP.md:
+Options:
   - Target norm clipping (per-sample): clip ‖φ‖ to max_norm when max_norm > 0.
   - Score output clipping: clip s_θ element-wise to [-score_clip, score_clip]
     when score_clip > 0.
@@ -160,7 +160,7 @@ def ddpm_loss(
     """
     Joint DDPM loss across all temperature levels.
 
-    From TECHNIQUES_SUMMARY.md §12 (Inner Loop):
+    From docs/TECHNIQUES_SUMMARY.md §4 (Training):
 
         L̂(θ) = (1/M) Σ_k (1/B) Σ_i ‖s_θ(x_{t,i}, t_i, β_k) - φ_i‖²
 

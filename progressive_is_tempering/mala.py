@@ -4,7 +4,7 @@ MALA (Metropolis-Adjusted Langevin Algorithm) rejuvenation.
 After importance resampling produces near-duplicate particles, MALA diversifies
 them while preserving the exact target π_β as the stationary distribution.
 
-MALA proposal from TECHNIQUES_SUMMARY.md §9:
+MALA proposal:
 
     x' = x + (h²/2) ∇_x log π_β(x) + h ε,   ε ~ N(0, I)
 

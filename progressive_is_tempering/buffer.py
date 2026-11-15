@@ -163,7 +163,7 @@ class ReplayBuffer:
         """
         Compute IS log-weights for bridging samples from π_{β_k} to π_{β_{k+1}}.
 
-        From TECHNIQUES_SUMMARY.md §10:
+        From docs/TECHNIQUES_SUMMARY.md §1:
             log w_{k→k+1}(x) = (β_{k+1} - β_k) · (-E(x) + ½‖x‖²)
 
         Parameters

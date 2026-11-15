@@ -15,7 +15,7 @@ Obtained by freezing u_θ constant over [t_{n-1}, t_n] and solving the
 resulting linear SDE in closed form. When u_θ ≡ 0 the step reduces exactly
 to the OU transition kernel, preserving detailed balance at the discrete level.
 
-Path-space log-weight (box formula from TECHNIQUES_SUMMARY.md §7):
+Path-space log-weight (docs/TECHNIQUES_SUMMARY.md §3):
 
     log w = Σ_n [log p_ρ(x_n|x_{n-1}) - log q_θ(x_{n-1}|x_n)]
             - (1-β) ½‖x_0‖² - β E(x_0) + ½‖x_T‖²

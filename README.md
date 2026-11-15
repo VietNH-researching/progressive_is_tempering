@@ -37,7 +37,7 @@ Install the JAX build that matches your accelerator; see the
 | DW4 | `notebooks/dw4/` | EGNN |
 | LJ13 | `notebooks/lj13/` | EGNN |
 | LJ55 | `notebooks/lj55/` | EGNN |
-| Alanine dipeptide (ff14SB + OBC1, 300 K) | `notebooks/aldp/` | DiT |
+| Alanine dipeptide (300 K) | `notebooks/aldp/` | DiT |
 
 Each notebook is self-contained. Its `.py` file (Jupytext percent format) is
 the source, and the `.ipynb` is paired with it. Hyperparameters are in
